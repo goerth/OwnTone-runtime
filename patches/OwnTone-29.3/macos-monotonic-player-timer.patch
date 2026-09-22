@@ -1,0 +1,209 @@
+--- a/src/player.c
++++ b/src/player.c
+@@ -320,8 +320,14 @@
+ // Playback timer
+ #ifdef HAVE_TIMERFD
+ static int pb_timer_fd;
+-#else
++#elif defined(HAVE_TIMER_SETTIME)
+ timer_t pb_timer;
++#else
++// macOS does not provide timerfd or POSIX timer overrun counts. A libevent
++// timeout wakes the player, while this absolute deadline restores any 10 ms
++// ticks coalesced while the player thread was busy writing to outputs.
++static struct timespec pb_timer_next_tick;
++static bool pb_timer_next_tick_valid;
+ #endif
+ static struct event *pb_timer_ev;
+ 
+@@ -336,6 +342,46 @@
+ // True if we are trying to recover from a major playback timer overrun (write problems)
+ static bool pb_write_recovery;
+ 
++#if !defined(HAVE_TIMERFD) && !defined(HAVE_TIMER_SETTIME)
++static struct timespec
++timespec_multiply(struct timespec value, uint64_t multiplier)
++{
++  struct timespec result;
++  uint64_t nanoseconds;
++
++  nanoseconds = (uint64_t)value.tv_nsec * multiplier;
++  result.tv_sec = value.tv_sec * multiplier + nanoseconds / 1000000000ULL;
++  result.tv_nsec = nanoseconds % 1000000000ULL;
++
++  return result;
++}
++
++static uint64_t
++pb_timer_ticks_due(struct timespec now)
++{
++  struct timespec elapsed;
++  struct timespec advance;
++  uint64_t elapsed_ns;
++  uint64_t interval_ns;
++  uint64_t ticks_due;
++
++  ticks_due = 1;
++  if (timespec_cmp(now, pb_timer_next_tick) >= 0)
++    {
++      elapsed = timespec_sub(now, pb_timer_next_tick);
++      elapsed_ns = (uint64_t)elapsed.tv_sec * 1000000000ULL + elapsed.tv_nsec;
++      interval_ns = (uint64_t)player_tick_interval.tv_sec * 1000000000ULL + player_tick_interval.tv_nsec;
++      if (interval_ns > 0)
++        ticks_due += elapsed_ns / interval_ns;
++    }
++
++  advance = timespec_multiply(player_tick_interval, ticks_due);
++  pb_timer_next_tick = timespec_add(pb_timer_next_tick, advance);
++
++  return ticks_due;
++}
++#endif
++
+ // Audio source
+ static uint32_t cur_plid;
+ static uint32_t cur_plversion;
+@@ -1286,12 +1332,21 @@
+     DPRINTF(E_LOG, L_PLAYER, "Error reading timer\n");
+   else if (overrun > 0)
+     overrun--;
+-#else
++#elif defined(HAVE_TIMER_SETTIME)
+   ret = timer_getoverrun(pb_timer);
+   if (ret < 0)
+     DPRINTF(E_LOG, L_PLAYER, "Error getting timer overrun\n");
+   else
+     overrun = ret;
++#else
++  if (!pb_timer_next_tick_valid)
++    return;
++
++  ret = clock_gettime(CLOCK_MONOTONIC, &ts);
++  if (ret < 0)
++    DPRINTF(E_LOG, L_PLAYER, "Error reading monotonic playback clock\n");
++  else
++    overrun = pb_timer_ticks_due(ts) - 1;
+ #endif /* HAVE_TIMERFD */
+ 
+   // We are too delayed, probably some output blocked: reset if first overrun or abort if second overrun
+@@ -1684,21 +1739,44 @@
+ static int
+ pb_timer_start(void)
+ {
++#if !defined(HAVE_TIMERFD) && !defined(HAVE_TIMER_SETTIME)
++  struct timespec now;
++  struct timeval timeout;
++#else
+   struct itimerspec tick;
++#endif
+   int ret;
+ 
+   // The stop timers will be active if we have recently paused, but now that the
+   // playback loop has been kicked off, we deactivate them
+   outputs_stop_delayed_cancel();
++
++#if !defined(HAVE_TIMERFD) && !defined(HAVE_TIMER_SETTIME)
++  ret = clock_gettime(CLOCK_MONOTONIC, &now);
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Could not read monotonic playback clock: %s\n", strerror(errno));
++      return -1;
++    }
+ 
++  pb_timer_next_tick = timespec_add(now, player_tick_interval);
++  pb_timer_next_tick_valid = true;
++  timeout.tv_sec = player_tick_interval.tv_sec;
++  timeout.tv_usec = player_tick_interval.tv_nsec / 1000;
++  ret = event_add(pb_timer_ev, &timeout);
++#else
+   ret = event_add(pb_timer_ev, NULL);
++#endif
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Could not add playback timer\n");
+-
++#if !defined(HAVE_TIMERFD) && !defined(HAVE_TIMER_SETTIME)
++      pb_timer_next_tick_valid = false;
++#endif
+       return -1;
+     }
+ 
++#if defined(HAVE_TIMERFD) || defined(HAVE_TIMER_SETTIME)
+   tick.it_interval = player_tick_interval;
+   tick.it_value = player_tick_interval;
+ 
+@@ -1713,6 +1791,7 @@
+ 
+       return -1;
+     }
++#endif
+ 
+   return 0;
+ }
+@@ -1720,11 +1799,16 @@
+ static int
+ pb_timer_stop(void)
+ {
++#if defined(HAVE_TIMERFD) || defined(HAVE_TIMER_SETTIME)
+   struct itimerspec tick;
+   int ret;
++#endif
+ 
+   event_del(pb_timer_ev);
+ 
++#if !defined(HAVE_TIMERFD) && !defined(HAVE_TIMER_SETTIME)
++  pb_timer_next_tick_valid = false;
++#else
+   memset(&tick, 0, sizeof(struct itimerspec));
+ 
+ #ifdef HAVE_TIMERFD
+@@ -1737,6 +1821,7 @@
+       DPRINTF(E_LOG, L_PLAYER, "Could not disarm playback timer: %s\n", strerror(errno));
+       return -1;
+     }
++#endif
+ 
+   return 0;
+ }
+@@ -3985,8 +4070,10 @@
+ #ifdef HAVE_TIMERFD
+   pb_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+   ret = pb_timer_fd;
+-#else
++#elif defined(HAVE_TIMER_SETTIME)
+   ret = timer_create(CLOCK_MONOTONIC, NULL, &pb_timer);
++#else
++  ret = 0;
+ #endif
+   if (ret < 0)
+     {
+@@ -3997,8 +4084,10 @@
+   CHECK_NULL(L_PLAYER, evbase_player = event_base_new());
+ #ifdef HAVE_TIMERFD
+   CHECK_NULL(L_PLAYER, pb_timer_ev = event_new(evbase_player, pb_timer_fd, EV_READ | EV_PERSIST, playback_cb, NULL));
+-#else
++#elif defined(HAVE_TIMER_SETTIME)
+   CHECK_NULL(L_PLAYER, pb_timer_ev = event_new(evbase_player, SIGALRM, EV_SIGNAL | EV_PERSIST, playback_cb, NULL));
++#else
++  CHECK_NULL(L_PLAYER, pb_timer_ev = event_new(evbase_player, -1, EV_PERSIST, playback_cb, NULL));
+ #endif
+   CHECK_NULL(L_PLAYER, cmdbase = commands_base_new(evbase_player, NULL));
+ 
+@@ -4035,7 +4124,7 @@
+   event_base_free(evbase_player);
+ #ifdef HAVE_TIMERFD
+   close(pb_timer_fd);
+-#else
++#elif defined(HAVE_TIMER_SETTIME)
+   timer_delete(pb_timer);
+ #endif
+  error_history_free:
+@@ -4053,7 +4142,7 @@
+ 
+ #ifdef HAVE_TIMERFD
+   close(pb_timer_fd);
+-#else
++#elif defined(HAVE_TIMER_SETTIME)
+   timer_delete(pb_timer);
+ #endif
+ 

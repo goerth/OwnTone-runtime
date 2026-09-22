@@ -1,0 +1,34 @@
+diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
+index 0ff4120..83e08f5 100644
+--- a/src/evrtsp/rtsp.c
++++ b/src/evrtsp/rtsp.c
+@@ -1461,6 +1461,7 @@ evrtsp_make_request(struct evrtsp_connection *evcon,
+     struct evrtsp_request *req,
+     enum evrtsp_cmd_type type, const char *uri)
+ {
++	int ret;
+ event_debug(("%s: TEST", __func__));
+ 
+ 	/* We are making a request */
+@@ -1485,8 +1486,19 @@ event_debug(("%s: TEST", __func__));
+ 	TAILQ_INSERT_TAIL(&evcon->requests, req, next);
+ 
+ 	/* If the connection object is not connected; make it so */
+-	if (!evrtsp_connected(evcon))
+-		return (evrtsp_connection_connect(evcon));
++	if (!evrtsp_connected(evcon)) {
++		ret = evrtsp_connection_connect(evcon);
++		if (ret < 0) {
++			/*
++			 * The caller still owns and frees a request when this function
++			 * fails. Do not leave the same request in the connection queue,
++			 * where connection cleanup would free it a second time.
++			 */
++			TAILQ_REMOVE(&evcon->requests, req, next);
++			req->evcon = NULL;
++		}
++		return (ret);
++	}
+ 
+ 	/*
+ 	 * If it's connected already and we are the first in the queue,

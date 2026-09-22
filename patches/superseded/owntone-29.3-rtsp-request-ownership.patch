@@ -1,0 +1,28 @@
+From: AirPlay Controller local integration
+Subject: [PATCH] airplay: preserve queued RTSP request ownership on connect failure
+
+`evrtsp_make_request()` inserts the request into the connection queue before
+attempting the socket connection. It retains that request even when the
+immediate connection attempt returns an error. `sequence_continue()` then
+freed the same request before deferred session cleanup walked the connection
+queue, causing a deterministic use-after-free/SIGSEGV when an AirPlay 2 target
+was temporarily unreachable.
+
+Mark the request as transferred immediately after `evrtsp_make_request()`.
+The deferred `session_free()` path then releases it exactly once with the rest
+of the connection queue.
+
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -3817,6 +3817,11 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
+   DPRINTF(E_DBG, L_AIRPLAY, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
+ 
+   ret = evrtsp_make_request(session->ctrl, req, cur_request->rtsp_type, uri);
++  // evrtsp_make_request() queues the request before connecting and retains it
++  // even when the immediate connection attempt fails. The connection cleanup
++  // path now owns the request in both the success and failure cases.
++  req = NULL;
++
+   if (ret < 0)
+     goto error;
+ 

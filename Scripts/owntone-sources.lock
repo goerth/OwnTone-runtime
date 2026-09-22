@@ -1,0 +1,20 @@
+# Pinned upstream sources for Scripts/build-owntone-runtime.sh.
+# Regenerate with --update-lock. Columns: name, version, sha256, url.
+gmp	6.3.0	a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898	https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz
+libgpg-error	1.61	7a85413f2bc354f4f8aa832b718af122e48965e9e0eb9012ee659c13c6385c93	https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-1.61.tar.bz2
+libgcrypt	1.12.3	98d1b0b3202d2b03fa754a35aa3cbbfcf526a3260d8d2ee213748001b1043006	https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.12.3.tar.bz2
+libunistring	1.4.2	5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c	https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz
+libtasn1	4.21.0	1d8a444a223cc5464240777346e125de51d8e6abf0b8bac742ac84609167dc87	https://ftp.gnu.org/gnu/libtasn1/libtasn1-4.21.0.tar.gz
+nettle	3.10.2	fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5	https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz
+gnutls	3.8.13	ffed8ec1bf09c2426d4f14aae377de4753b53e537d685e604e99a8b16ca9c97e	https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.13.tar.xz
+libevent	2.1.13-stable	f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c	https://github.com/libevent/libevent/releases/download/release-2.1.13-stable/libevent-2.1.13-stable.tar.gz
+sqlite	3530400	0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c	https://sqlite.org/2026/sqlite-autoconf-3530400.tar.gz
+libconfuse	3.4	36bfa3928f9c323914c7c8317e8722cb22f41db69d7c9d4c24b4689fa955445d	https://github.com/libconfuse/libconfuse/releases/download/v3.4/confuse-3.4.tar.xz
+libsodium	1.0.22	adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349	https://github.com/jedisct1/libsodium/releases/download/1.0.22-RELEASE/libsodium-1.0.22.tar.gz
+json-c	0.19	37ad0249902e301bd9052bf712e511fcc6acff4ecaad4b5900aad9ce564e26de	https://github.com/json-c/json-c/releases/download/json-c-0.19-20260627/json-c-0.19.tar.gz
+libplist	2.7.0	7ac42301e896b1ebe3c654634780c82baa7cb70df8554e683ff89f7c2643eb8b	https://github.com/libimobiledevice/libplist/releases/download/2.7.0/libplist-2.7.0.tar.bz2
+protobuf-c	1.5.2	e2c86271873a79c92b58fef7ebf8de1aa0df4738347a8bd5d4e65a80a16d0d24	https://github.com/protobuf-c/protobuf-c/releases/download/v1.5.2/protobuf-c-1.5.2.tar.gz
+libinotify	20240724	5cc3fb7af407b17b7daa871cc98bb882716c4b5c296fadfb66bfe86c37cc599c	https://github.com/libinotify-kqueue/libinotify-kqueue/releases/download/20240724/libinotify-20240724.tar.gz
+libopus	1.5.2	65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1	https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
+ffmpeg	7.1.5	de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f	https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz
+owntone	29.3	aa0cbfc5651aa65776a8bd2112c9e0a904b2185c837900d3f6494b9ec6e8c547	https://github.com/owntone/owntone-server/releases/download/29.3/owntone-29.3.tar.xz

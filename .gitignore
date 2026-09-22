@@ -1,0 +1,9 @@
+# Build tree and release artifacts. Upstream sources are fetched here at build
+# time and must never be committed: this repository pins versions and
+# checksums, not source.
+.build/
+dist/
+
+# macOS metadata
+.DS_Store
+._*

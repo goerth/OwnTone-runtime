@@ -1,0 +1,286 @@
+--- a/src/player.c
++++ b/src/player.c
+@@ -2933,7 +2933,8 @@ speaker_offset_ms_set(void *arg, int *retval)
+   struct speaker_attr_param *param = arg;
+   struct output_device *device;
++  int previous_offset_ms;
+ 
+-  if (param->offset_ms < -2000 || param->offset_ms > 2000)
++  if (param->offset_ms < -4000 || param->offset_ms > 4000)
+     goto error;
+ 
+   device = outputs_device_get(param->spk_id);
+@@ -2940,7 +2941,13 @@ speaker_offset_ms_set(void *arg, int *retval)
+   if (!device)
+     goto error;
+ 
++  previous_offset_ms = device->offset_ms;
+   device->offset_ms = param->offset_ms;
++  if (db_speaker_save(device) < 0)
++    {
++      device->offset_ms = previous_offset_ms;
++      goto error_save;
++    }
+ 
+   // We can't change offset during playback, but if playback is paused we stop
+   // the output session, so the new offset is used when restarting playback
+@@ -2955,8 +2962,13 @@ speaker_offset_ms_set(void *arg, int *retval)
+ 
+   return COMMAND_END;
+ 
++ error_save:
++  DPRINTF(E_LOG, L_PLAYER, "Error saving offset_ms %d for speaker id %" PRIu64 "\n", param->offset_ms, param->spk_id);
++  *retval = -1;
++  return COMMAND_END;
++
+  error:
+-  DPRINTF(E_LOG, L_PLAYER, "Error setting offset_ms %d, outside of supported range -2000 to 2000\n", param->offset_ms);
++  DPRINTF(E_LOG, L_PLAYER, "Error setting offset_ms %d, outside of supported range -4000 to 4000\n", param->offset_ms);
+   *retval = -1;
+   return COMMAND_END;
+ }
+--- a/src/outputs/cast.c
++++ b/src/outputs/cast.c
+@@ -97,6 +97,7 @@
+ // use a 20 ms packet, so 50 pkts/sec, because that's the default for ffmpeg.
+ // A 20 ms audio packet at 48000 kHz makes this number 48000 * (20 / 1000)
+ #define CAST_SAMPLES_PER_PACKET 960
++#define CAST_PACKET_DURATION_MS ((1000 * CAST_SAMPLES_PER_PACKET) / CAST_QUALITY_SAMPLE_RATE_DEFAULT)
+ 
+ #define CAST_QUALITY_SAMPLE_RATE_DEFAULT     48000
+ #define CAST_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
+@@ -105,15 +106,15 @@
+ // This is an arbitrary value which just needs to be kept in sync with the config
+ #define CAST_CONFIG_MAX_VOLUME 11
+ 
+-// This makes the rtp session buffer 6 seconds of audio (6 sec * 50 pkts/sec),
++// This makes the rtp session buffer 10 seconds of audio (10 sec * 50 pkts/sec),
+ // which can be used for delayed transmission (and retransmission)
+-#define CAST_PACKET_BUFFER_SIZE 300
++#define CAST_PACKET_BUFFER_SIZE 500
+ 
+ // Max number of RTP packets for one artwork image
+ #define CAST_PACKET_ARTWORK_SIZE 200
+ 
+ // Max (absolute) value the user is allowed to set offset_ms in the config file
+-#define CAST_OFFSET_MAX 1000
++#define CAST_OFFSET_MAX 4000
+ 
+ // This is just my measurement of how much extra delay is required to start at
+ // the same time as Airplay. The value was found experimentally.
+@@ -221,12 +222,14 @@ struct cast_session
+ 
+   uint32_t ssrc_id;
+ 
+-  // For initial buffering (delay playback to achieve some sort of sync).
+-  struct timespec start_pts;
+-  struct timespec delay_ts;
++  // Keep this many packets between the producer and this receiver. Unlike a
++  // one-shot startup sleep, a fixed packet lag cannot be consumed by fast ACKs.
++  uint16_t target_lag_packets;
+   uint16_t seqnum_next;
+ 
+   uint16_t ack_last;
++  bool target_delay_ms_seen;
++  uint16_t target_delay_ms_last;
+ 
+   // Outgoing request which have the USE_REQUEST_ID flag get a new id, and a
+   // callback is registered. The callback is called when an incoming message
+@@ -408,7 +409,7 @@ static struct cast_msg cast_msgs[] =
+     // storeTime unknown meaning - perhaps size of buffer?
+     // targetDelay - should be RTP delay in ms, but doesn't seem to change anything?
+     // vp8 timebase - see rfc7741
+-    .payload = "{'type':'OFFER','seqNum':%u,'offer':{'castMode':'mirroring','supportedStreams':[{'index':0,'type':'audio_source','codecName':'opus','rtpProfile':'cast','rtpPayloadType':" NTOSTR(CAST_RTP_PAYLOADTYPE_AUDIO) ",'ssrc':%" PRIu32 ",'storeTime':400,'targetDelay':400,'bitRate':128000,'sampleRate':" NTOSTR(CAST_QUALITY_SAMPLE_RATE_DEFAULT) ",'timeBase':'1/" NTOSTR(CAST_QUALITY_SAMPLE_RATE_DEFAULT) "','channels':" NTOSTR(CAST_QUALITY_CHANNELS_DEFAULT) ",'receiverRtcpEventLog':false},{'codecName':'vp8','index':1,'maxBitRate':5000000,'maxFrameRate':'30000/1000','receiverRtcpEventLog':false,'renderMode':'video','resolutions':[{'height':900,'width':1600}],'rtpPayloadType':" NTOSTR(CAST_RTP_PAYLOADTYPE_VIDEO) ",'rtpProfile':'cast','ssrc':999999,'targetDelay':400,'timeBase':'1/90000','type':'video_source'}]}}",
++    .payload = "{'type':'OFFER','seqNum':%u,'offer':{'castMode':'mirroring','supportedStreams':[{'index':0,'type':'audio_source','codecName':'opus','rtpProfile':'cast','rtpPayloadType':" NTOSTR(CAST_RTP_PAYLOADTYPE_AUDIO) ",'ssrc':%" PRIu32 ",'storeTime':0,'targetDelay':0,'bitRate':128000,'sampleRate':" NTOSTR(CAST_QUALITY_SAMPLE_RATE_DEFAULT) ",'timeBase':'1/" NTOSTR(CAST_QUALITY_SAMPLE_RATE_DEFAULT) "','channels':" NTOSTR(CAST_QUALITY_CHANNELS_DEFAULT) ",'receiverRtcpEventLog':false},{'codecName':'vp8','index':1,'maxBitRate':5000000,'maxFrameRate':'30000/1000','receiverRtcpEventLog':false,'renderMode':'video','resolutions':[{'height':900,'width':1600}],'rtpPayloadType':" NTOSTR(CAST_RTP_PAYLOADTYPE_VIDEO) ",'rtpProfile':'cast','ssrc':999999,'targetDelay':0,'timeBase':'1/90000','type':'video_source'}]}}",
+     .flags = USE_TRANSPORT_ID | USE_REQUEST_ID,
+   },
+   {
+@@ -1017,7 +1019,7 @@ packet_send(struct cast_session *cs, uint16_t seqnum)
+   if (!pkt)
+     {
+       DPRINTF(E_WARN, L_CAST, "Packet to '%s' is missing in our buffer\n", cs->devname);
+-      return 0; // Don't fail session over a missing packet (or should we?)
++      return 0;
+     }
+ 
+   ret = send(cs->udp_fd, pkt->data, pkt->data_len, 0);
+@@ -1038,7 +1040,7 @@ packet_send(struct cast_session *cs, uint16_t seqnum)
+     cs->master_session->rtp_session->pktbuf_len,
+     cs->devname);
+ */
+-  return 0;
++  return 1;
+ }
+ 
+ static int
+@@ -1050,14 +1052,51 @@ packet_send_next(struct cast_session *cs)
+     return 0; // Nothing to send right now
+ 
+   ret = packet_send(cs, cs->seqnum_next);
+-  if (ret < 0)
++  if (ret <= 0)
+     return ret;
+ 
+   cs->seqnum_next++;
+ 
+-  return 0;
++  return 1;
+ }
+ 
++// Number of committed packets not yet consumed by this receiver. Unsigned
++// subtraction deliberately handles the 16-bit RTP sequence wrap. The caller
++// keeps this value below half the sequence space, so the result is unambiguous.
++static inline uint16_t
++packet_backlog_get(struct cast_session *cs)
++{
++  return (uint16_t)(cs->master_session->rtp_session->seqnum - cs->seqnum_next);
++}
++
++// Sends at most one packet and never consumes the configured steady-state lag.
++// Both the output writer and RTCP ACK callback use this gate, otherwise a fast
++// ACK loop can drain several seconds of buffered audio in a fraction of that
++// time and make offset_ms inaudible after startup.
++static int
++packet_send_next_if_due(struct cast_session *cs)
++{
++  uint16_t backlog;
++  int ret;
++
++  backlog = packet_backlog_get(cs);
++  if (backlog <= cs->target_lag_packets)
++    return 0;
++
++  ret = packet_send_next(cs);
++  if (ret == 0)
++    {
++      DPRINTF(E_LOG, L_CAST, "Packet cursor for '%s' fell outside RTP history (next=%" PRIu16 ", producer=%" PRIu16 ", backlog=%" PRIu16 ", target=%" PRIu16 ")\n",
++        cs->devname, cs->seqnum_next, cs->master_session->rtp_session->seqnum,
++        backlog, cs->target_lag_packets);
++      return -1;
++    }
++  if (ret < 0)
++    return ret;
++
++  return 1;
++}
++
+ /* TODO This does not currently work - need to investigate what sync the devices support
+ static void
+ packets_sync_send(struct cast_master_session *cms, struct timespec pts)
+@@ -1292,1 +1333,9 @@ xr_packet_process(struct cast_session *cs, uint8_t *data, size_t len)
++      if (!cs->target_delay_ms_seen || cs->target_delay_ms_last != feedback.target_delay_ms)
++        {
++          DPRINTF(E_INFO, L_CAST, "RTCP target delay from '%s': %" PRIu16 " ms\n",
++            cs->devname, feedback.target_delay_ms);
++          cs->target_delay_ms_seen = true;
++          cs->target_delay_ms_last = feedback.target_delay_ms;
++        }
++
+       // Retransmission
+@@ -1303,7 +1342,12 @@ xr_packet_process(struct cast_session *cs, uint8_t *data, size_t len)
+       cs->ack_last = frame_id_expand(feedback.frame_id_last, cs->seqnum_next - 1);
+       if (cs->ack_last + 1 == cs->seqnum_next)
+ 	{
+-	  packet_send_next(cs); // Last packet was ack'ed, let's send a new packet
++	  ret = packet_send_next_if_due(cs);
++	  if (ret < 0)
++	    {
++	      cs->state = CAST_STATE_APP_LAUNCHED;
++	      cast_session_shutdown(cs, CAST_STATE_FAILED);
++	    }
+ 	}
+     }
+ /*  else if (xrpkt.packet_type == CAST_RTCP_PT_FEEDBACK && xrpkt.ic == 1)
+@@ -1950,16 +1995,24 @@ cast_session_make(struct output_device *device, int family, int callback_id)
+     }
+ 
+   delay_ms = outputs_buffer_duration_ms_get() + CAST_DEVICE_START_DELAY_MS;
+-  if (delay_ms + device->offset_ms < 0)
+-    DPRINTF(E_LOG, L_CAST, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, delay_ms, device->offset_ms);
+-  else
+-    delay_ms += device->offset_ms;
+-
+-  cs->delay_ts.tv_sec  = (delay_ms / 1000);
+-  cs->delay_ts.tv_nsec = (delay_ms % 1000) * 1000000UL;
++  if (device->offset_ms < 0 && (uint64_t)-device->offset_ms > delay_ms)
++    {
++      DPRINTF(E_LOG, L_CAST, "'%s' configured with invalid start time (delay=%" PRIu64 ", offset=%d)\n", device->name, delay_ms, device->offset_ms);
++      goto out_close_connection;
++    }
++  delay_ms += device->offset_ms;
+ 
+-  DPRINTF(E_DBG, L_CAST, "Delay is set to %ld:%09ld\n", (long)cs->delay_ts.tv_sec, (long)cs->delay_ts.tv_nsec);
++  cs->target_lag_packets = (delay_ms + CAST_PACKET_DURATION_MS - 1) / CAST_PACKET_DURATION_MS;
++  if (cs->target_lag_packets >= CAST_PACKET_BUFFER_SIZE || cs->target_lag_packets >= UINT16_MAX / 2)
++    {
++      DPRINTF(E_LOG, L_CAST, "Playback lag for '%s' does not fit RTP history (delay_ms=%" PRIu64 ", packets=%" PRIu16 ", capacity=%d)\n",
++        device->name, delay_ms, cs->target_lag_packets, CAST_PACKET_BUFFER_SIZE);
++      goto out_close_connection;
++    }
+ 
++  DPRINTF(E_INFO, L_CAST, "Playback lag for '%s': offset_ms=%d, total_delay_ms=%" PRIu64 ", target_lag_packets=%" PRIu16 "\n",
++    device->name, device->offset_ms, delay_ms, cs->target_lag_packets);
++
+   cs->ev = event_new(evbase_player, cs->server_fd, EV_READ | EV_PERSIST, cast_listen_cb, cs);
+   if (!cs->ev)
+     {
+@@ -2222,7 +2275,6 @@ cast_write(struct output_buffer *obuf)
+ {
+   struct cast_session *cs;
+   struct cast_session *next;
+-  struct timespec ts;
+   int i;
+   int ret;
+ 
+@@ -2253,41 +2305,32 @@ cast_write(struct output_buffer *obuf)
+ 
+       if (cs->state == CAST_STATE_APP_READY)
+ 	{
+-	  // Sets that playback will start at time = start_pts with the packet that comes after seqnum_last
+-	  cs->start_pts = timespec_add(obuf->pts, cs->delay_ts);
+ 	  cs->seqnum_next = cast_master_session->rtp_session->seqnum;
+ 	  cs->state = CAST_STATE_BUFFERING;
+-
+-	  clock_gettime(CLOCK_MONOTONIC, &ts);
+-	  DPRINTF(E_DBG, L_CAST, "Start time is %ld:%09ld,, current time is %ld:%09ld,\n", (long)cs->start_pts.tv_sec, (long)cs->start_pts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec);
++	  DPRINTF(E_DBG, L_CAST, "Buffering '%s' from producer seqnum %" PRIu16 " to target lag %" PRIu16 " packets\n",
++	    cs->devname, cs->seqnum_next, cs->target_lag_packets);
+ 	}
+ 
+       if (cs->state == CAST_STATE_BUFFERING)
+ 	{
+-	  clock_gettime(CLOCK_MONOTONIC, &ts);
+-	  if (timespec_cmp(cs->start_pts, ts) > 0)
++	  if (packet_backlog_get(cs) <= cs->target_lag_packets)
+ 	    continue; // Keep buffering
+ 	  cs->state = CAST_STATE_STREAMING;
++	  DPRINTF(E_INFO, L_CAST, "Streaming '%s' with RTP lag %" PRIu16 "/%" PRIu16 " packets\n",
++	    cs->devname, packet_backlog_get(cs), cs->target_lag_packets);
+ 	}
+ 
+-      // We send packets to the device ping-pong style, meaning that we send the
+-      // first packet, wait for an ack, then send the next, wait etc. This can
+-      // be broken by "no ping", meaning cast_rtcp_cb() didn't have a packet to
+-      // send, or "no pong", meaning the ack is late or lost. To keep going we
+-      // must send a packet from here, so this condition is an inverse check for
+-      // such a state. The first part will be false if we didn't get an ACK,
+-      // or when sending first packet, and the second will be false if we were
+-      // out of packets.
+-      if (cs->ack_last + 1 == cs->seqnum_next && cs->seqnum_next + 1 != cast_master_session->rtp_session->seqnum)
+-        continue;
+-
+-      ret = packet_send_next(cs);
++      ret = packet_send_next_if_due(cs);
+       if (ret < 0)
+         {
+ 	  // Downgrade state immediately to avoid further write attempts (session shutdown is async)
+ 	  cs->state = CAST_STATE_APP_LAUNCHED;
+ 	  cast_session_shutdown(cs, CAST_STATE_FAILED);
+ 	}
++      else if (ret > 0 && (cs->seqnum_next % 50) == 0)
++	DPRINTF(E_DBG, L_CAST, "RTP lag for '%s': producer=%" PRIu16 ", next=%" PRIu16 ", backlog=%" PRIu16 ", target=%" PRIu16 "\n",
++	  cs->devname, cast_master_session->rtp_session->seqnum, cs->seqnum_next,
++	  packet_backlog_get(cs), cs->target_lag_packets);
+     }
+ }
+ 
