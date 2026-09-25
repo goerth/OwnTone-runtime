@@ -259,7 +259,11 @@ configure_and_make() {
     # CXXFLAGS matters even though nothing here is a C++ project: libplist
     # builds a C++ API layer, and without it those objects are compiled against
     # the SDK's own deployment target rather than ours.
-    ./configure --prefix="${prefix}" "$@" \
+    # GNU libtool probes kern.argmax on macOS. Sandboxed build hosts can deny
+    # that sysctl, leaving max_cmd_len empty; libtool then emits a partial-link
+    # chain that drops hidden internal symbols. 196608 is the conservative
+    # three-quarter ARG_MAX value used by libtool on macOS.
+    lt_cv_sys_max_cmd_len=196608 ./configure --prefix="${prefix}" "$@" \
       CC="/usr/bin/clang" \
       CXX="/usr/bin/clang++" \
       CPPFLAGS="${common_cppflags}" \

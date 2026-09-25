@@ -1,0 +1,210 @@
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -284,6 +284,11 @@
+   // amplifier or DSP delays)
+   int offset_samples;
+ 
++  /* Diagnostics only: how often this receiver has asked for lost audio. */
++  uint64_t resend_requests;
++  uint64_t resend_packets;
++  time_t resend_logged_at;
++
+   /* AirTunes v2 */
+   unsigned short server_port;
+   unsigned short control_port;
+@@ -3571,9 +3576,166 @@
+     }
+   errno = send_errno;
+   return ret;
++}
++
++/* Diagnostics only: what the receiver's own clock is doing.
++ *
++ * An AirPlay 1 receiver drives this exchange, and its request carries the
++ * receiver's clock in the originate field. The difference between that and our
++ * clock is dominated by a constant one-way delay, so the difference itself says
++ * little - but its CHANGE over time is the receiver's clock skew against ours,
++ * with the delay cancelled out. That is the number needed to tell a steady
++ * drift apart from a receiver that jumps, and nothing here alters a reply.
++ */
++struct raop_timing_observation
++{
++  union net_sockaddr peer_addr;
++  bool in_use;
++  int64_t first_offset_us;
++  int64_t first_local_us;
++  int64_t last_offset_us;
++  int64_t last_local_us;
++  int64_t last_logged_local_us;
++  uint64_t exchanges;
++};
++
++#define RAOP_TIMING_OBSERVATIONS 8
++/* One line every two seconds per receiver keeps a long session readable while
++ * still showing a minute-scale trend. */
++#define RAOP_TIMING_LOG_INTERVAL_US 2000000
++
++static struct raop_timing_observation raop_timing_observations[RAOP_TIMING_OBSERVATIONS];
++
++static int64_t
++raop_ntp_to_us(struct ntp_stamp *ns)
++{
++  return (int64_t)ns->sec * 1000000 + ((int64_t)ns->frac * 1000000) / 0x100000000LL;
++}
++
++/* The same address comparison `session_find_by_address` performs, without
++ * needing a session: the observation outlives one session on purpose, so a
++ * reconnect does not hide a clock that kept walking. */
++static bool
++raop_timing_same_peer(union net_sockaddr *a, union net_sockaddr *b)
++{
++  if (a->sa.sa_family != b->sa.sa_family)
++    return false;
++
++  if (a->sa.sa_family == AF_INET)
++    return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
++
++  if (a->sa.sa_family == AF_INET6)
++    return IN6_ARE_ADDR_EQUAL(&a->sin6.sin6_addr, &b->sin6.sin6_addr);
++
++  return false;
+ }
+ 
++static struct raop_timing_observation *
++raop_timing_observation_get(union net_sockaddr *peer_addr)
++{
++  struct raop_timing_observation *free_slot = NULL;
++  int i;
++
++  for (i = 0; i < RAOP_TIMING_OBSERVATIONS; i++)
++    {
++      if (!raop_timing_observations[i].in_use)
++	{
++	  if (!free_slot)
++	    free_slot = &raop_timing_observations[i];
++	  continue;
++	}
++
++      if (raop_timing_same_peer(&raop_timing_observations[i].peer_addr, peer_addr))
++	return &raop_timing_observations[i];
++    }
++
++  if (!free_slot)
++    return NULL;
++
++  memset(free_slot, 0, sizeof(*free_slot));
++  free_slot->peer_addr = *peer_addr;
++  free_slot->in_use = true;
++  return free_slot;
++}
++
+ static void
++raop_timing_observe(union net_sockaddr *peer_addr, uint8_t *req, struct ntp_stamp *recv_stamp)
++{
++  struct raop_timing_observation *observation;
++  struct raop_session *rs;
++  struct ntp_stamp origin_stamp;
++  char address[INET6_ADDRSTRLEN];
++  const char *devname;
++  int64_t origin_us, local_us, offset_us;
++  int64_t interval_us, interval_skew_ppm, session_skew_ppm;
++
++  observation = raop_timing_observation_get(peer_addr);
++  if (!observation)
++    return;
++
++  memcpy(&origin_stamp.sec, req + 24, 4);
++  memcpy(&origin_stamp.frac, req + 28, 4);
++  origin_stamp.sec = be32toh(origin_stamp.sec);
++  origin_stamp.frac = be32toh(origin_stamp.frac);
++
++  origin_us = raop_ntp_to_us(&origin_stamp);
++  local_us = raop_ntp_to_us(recv_stamp);
++  /* Both clocks start at their own epoch, so only the change of this is
++   * meaningful. It is kept as-is rather than normalised, so a reader can see
++   * the raw pair the numbers came from. */
++  offset_us = local_us - origin_us;
++
++  observation->exchanges++;
++  if (observation->exchanges == 1)
++    {
++      observation->first_offset_us = offset_us;
++      observation->first_local_us = local_us;
++      observation->last_offset_us = offset_us;
++      observation->last_local_us = local_us;
++      observation->last_logged_local_us = local_us;
++      return;
++    }
++
++  interval_us = local_us - observation->last_local_us;
++  if (interval_us <= 0)
++    return;
++
++  interval_skew_ppm = ((offset_us - observation->last_offset_us) * 1000000) / interval_us;
++  observation->last_offset_us = offset_us;
++  observation->last_local_us = local_us;
++
++  if (local_us - observation->last_logged_local_us < RAOP_TIMING_LOG_INTERVAL_US)
++    return;
++
++  observation->last_logged_local_us = local_us;
++
++  session_skew_ppm = 0;
++  if (local_us > observation->first_local_us)
++    session_skew_ppm = ((offset_us - observation->first_offset_us) * 1000000)
++      / (local_us - observation->first_local_us);
++
++  rs = session_find_by_address(peer_addr);
++  if (rs && rs->devname)
++    devname = rs->devname;
++  else
++    {
++      net_address_get(address, sizeof(address), peer_addr);
++      devname = address;
++    }
++
++  DPRINTF(E_INFO, L_RAOP,
++    "Receiver clock '%s': offset=%" PRId64 " us, since-start=%+" PRId64 " us over %" PRId64 " s"
++    " (%+" PRId64 " ppm), last-interval=%+" PRId64 " ppm, exchanges=%" PRIu64 "\n",
++    devname,
++    offset_us,
++    offset_us - observation->first_offset_us,
++    (local_us - observation->first_local_us) / 1000000,
++    session_skew_ppm,
++    interval_skew_ppm,
++    observation->exchanges);
++}
++
++static void
+ timing_svc_cb(int fd, short what, void *arg)
+ {
+   union net_sockaddr peer_addr;
+@@ -3611,6 +3773,8 @@
+       return;
+     }
+ 
++  raop_timing_observe(&peer_addr, req, &recv_stamp);
++
+   memset(res, 0, sizeof(res));
+ 
+   /* Header */
+@@ -3708,6 +3872,19 @@
+   seq_start = be16toh(seq_start);
+   seq_len = be16toh(seq_len);
+ 
++  /* Diagnostics only: timing that walks away because packets were lost looks
++   * nothing like a clock that walks away, and this is what tells them apart.
++   * The running totals are per session, so a quiet session stays quiet. */
++  rs->resend_requests++;
++  rs->resend_packets += seq_len;
++  if (rs->resend_logged_at == 0 || time(NULL) - rs->resend_logged_at >= 5)
++    {
++      rs->resend_logged_at = time(NULL);
++      DPRINTF(E_INFO, L_RAOP,
++	"Receiver '%s' asked for a resend: seq=%u count=%u (requests=%" PRIu64 ", packets=%" PRIu64 ")\n",
++	rs->devname, seq_start, seq_len, rs->resend_requests, rs->resend_packets);
++    }
++
+   packets_resend(rs, seq_start, seq_len);
+ }
+ 

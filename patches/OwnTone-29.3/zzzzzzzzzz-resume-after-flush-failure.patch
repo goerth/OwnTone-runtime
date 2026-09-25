@@ -1,0 +1,149 @@
+--- a/src/player.c
++++ b/src/player.c
+@@ -306,6 +306,8 @@
+ // Keep track of how many outputs need to call back when flushing internally
+ // from the player thread (where we can't use player_playback_pause)
+ static int player_flush_pending;
++// Only automatic underrun/output-delay suspension may restart after a flush.
++static bool player_flush_recovery;
+ 
+ // Config values and player settings category
+ static int speaker_autoselect;
+@@ -405,6 +407,9 @@
+ 
+ static int
+ pb_suspend(void);
++
++static int
++player_recovery_start(void);
+ 
+ 
+ /* ----------------------- Misc helpers and callbacks ----------------------- */
+@@ -1361,11 +1366,12 @@
+ 
+       DPRINTF(E_LOG, L_PLAYER, "Output delay detected (behind=%" PRIu64 ", max=%d), resetting all outputs\n", overrun, pb_write_deficit_max);
+       pb_write_recovery = true;
++      player_flush_recovery = true;
+       player_flush_pending = pb_suspend();
+       // No devices to wait for, just set the restart cb right away. Otherwise
+       // the trigger will be set by device_flush_cb.
+-      if (player_flush_pending == 0)
+-	input_buffer_full_cb(player_playback_start);
++      if (player_flush_pending == 0 && player_flush_recovery)
++	input_buffer_full_cb(player_recovery_start);
+ 
+       return;
+     }
+@@ -1432,11 +1438,12 @@
+       DPRINTF(E_LOG, L_PLAYER, "Source is not providing sufficient data, temporarily suspending playback (deficit=%zu/%zu bytes)\n",
+ 	pb_session.read_deficit, pb_session.read_deficit_max);
+ 
++      player_flush_recovery = true;
+       player_flush_pending = pb_suspend();
+       // No devices to wait for, just set the restart cb right away. Otherwise
+       // the trigger will be set by device_flush_cb.
+-      if (player_flush_pending == 0)
+-	input_buffer_full_cb(player_playback_start);
++      if (player_flush_pending == 0 && player_flush_recovery)
++	input_buffer_full_cb(player_recovery_start);
+     }
+ }
+ 
+@@ -1626,27 +1633,25 @@
+   if (!device)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Output device disappeared before flush completion!\n");
+-      goto out;
+     }
+   else if (status == OUTPUT_STATE_FAILED)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' failed during execution of flush command\n", device->type_name, device->name);
+-      goto out;
+     }
++  else
++    DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_flush_cb (status %d)\n", device->type_name, device->name, status);
+ 
+-  DPRINTF(E_DBG, L_PLAYER, "Callback from %s device %s to device_flush_cb (status %d)\n", device->type_name, device->name, status);
+-
+   // Used by pb_suspend - is basically the bottom half
+   if (player_flush_pending > 0)
+     {
+       player_flush_pending--;
+-      if (player_flush_pending == 0)
+-	input_buffer_full_cb(player_playback_start);
++      if (player_flush_pending == 0 && player_flush_recovery)
++	input_buffer_full_cb(player_recovery_start);
+     }
+ 
+-  outputs_device_stop_delayed(device, device_streaming_cb);
++  if (device && status != OUTPUT_STATE_FAILED)
++    outputs_device_stop_delayed(device, device_streaming_cb);
+ 
+- out:
+   commands_exec_end(cmdbase, 0);
+ }
+ 
+@@ -1888,6 +1893,8 @@
+ static void
+ pb_abort(void)
+ {
++  player_flush_recovery = false;
++  player_flush_pending = 0;
+   // Immediate stop of all outputs
+   outputs_stop(device_streaming_cb);
+   outputs_metadata_purge();
+@@ -2069,6 +2076,9 @@
+ static enum command_state
+ playback_stop(void *arg, int *retval)
+ {
++  player_flush_recovery = false;
++  player_flush_pending = 0;
++
+   if (player_state == PLAY_STOPPED)
+     {
+       *retval = 0;
+@@ -2281,6 +2291,21 @@
+ }
+ 
+ static enum command_state
++playback_recovery_start(void *arg, int *retval)
++{
++  // This check runs in the player thread, serialized with pause and stop.
++  if (!player_flush_recovery || player_state != PLAY_PAUSED)
++    {
++      *retval = 1; // Skip playback_start_bh.
++      return COMMAND_END;
++    }
++
++  player_flush_recovery = false;
++  player_flush_pending = 0;
++  return playback_start(arg, retval);
++}
++
++static enum command_state
+ playback_prev_bh(void *arg, int *retval)
+ {
+   struct db_queue_item *queue_item = NULL;
+@@ -2555,6 +2580,9 @@
+ static enum command_state
+ playback_pause(void *arg, int *retval)
+ {
++  player_flush_recovery = false;
++  player_flush_pending = 0;
++
+   if (player_state == PLAY_STOPPED)
+     {
+       *retval = -1;
+@@ -3475,6 +3503,12 @@
+   ret = commands_exec_sync(cmdbase, playback_start, playback_start_bh, NULL);
+ 
+   return ret;
++}
++
++static int
++player_recovery_start(void)
++{
++  return commands_exec_sync(cmdbase, playback_recovery_start, playback_start_bh, NULL);
+ }
+ 
+ /*
