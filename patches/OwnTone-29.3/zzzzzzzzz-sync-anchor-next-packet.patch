@@ -1,0 +1,88 @@
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 2596685..2ec0758 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -3533,6 +3533,30 @@ timestamp_set(struct raop_master_session *rms, struct timespec ts)
+ /* Optional per-device native synchronization comparison. Does not move the
+  * shared RTP/audio cursor. The same CLOCK_MONOTONIC source serves timing replies.
+  */
++/* Opt in with SOUNDFERRY_RAOP_NATIVE_SYNC_ANCHOR=next-packet to put the next
++ * audio packet's timestamp in the anchor field, as the protocol specifies,
++ * instead of a value derived from the play position.
++ */
++static bool
++raop_native_sync_anchors_on_next_packet(void)
++{
++  static bool resolved;
++  static bool on_next_packet;
++  const char *value;
++
++  if (resolved)
++    return on_next_packet;
++
++  value = getenv("SOUNDFERRY_RAOP_NATIVE_SYNC_ANCHOR");
++  on_next_packet = (value && strcasecmp(value, "next-packet") == 0);
++  resolved = true;
++
++  DPRINTF(E_LOG, L_RAOP, "Native sync packets will anchor on %s\n",
++    on_next_packet ? "the next audio packet (as specified)" : "the play position (original)");
++
++  return on_next_packet;
++}
++
+ static struct rtp_packet *
+ udp_inventory_native_sync_next(struct raop_session *rs, struct raop_master_session *rms,
+                                struct rtcp_timestamp stamp, uint8_t type)
+@@ -3560,11 +3584,30 @@ udp_inventory_native_sync_next(struct raop_session *rs, struct raop_master_sessi
+   delta_frames = (uint32_t)(delta_ns * 44100 / 1000000000LL);
+   stamp.pos += delta_frames;
+   stamp.ts = now;
+-  pkt = rtp_sync_packet_next(rms->rtp_session, stamp, type);
+-  /* Retain the user's per-speaker offset; native zero-offset lead is 1750 ms.
+-   * stamp already includes -offset_samples. Restore it only in the tail, so
+-   * the configured offset continues changing playout relative to source time.
++
++  /* The two forms below ask the receiver for the same latency - the native
++   * zero-offset lead of 1750 ms, plus the user's per-speaker offset - and
++   * differ in what they put in the anchor the receiver schedules against.
++   *
++   * The original form derives the anchor from the play position, which carries
++   * rms->input_buffer_samples (audio taken from the player but not yet
++   * packetised) and the extrapolation above. Both move from one packet to the
++   * next, so the anchor does too, and a receiver that latches its schedule
++   * from the first sync packet of a session latches whatever they happened to
++   * be. The specification says this field is the RTP timestamp of the next
++   * audio packet, which is rtp_session->pos and nothing else.
+    */
++  if (raop_native_sync_anchors_on_next_packet())
++    {
++      /* What is playing now is the write head less what the receiver is
++       * holding, so the pair stays consistent while both terms drop out.
++       */
++      stamp.pos = rms->rtp_session->pos - rms->output_buffer_samples - (uint32_t)rs->offset_samples;
++      pkt = rtp_sync_packet_next(rms->rtp_session, stamp, type);
++      return pkt;
++    }
++
++  pkt = rtp_sync_packet_next(rms->rtp_session, stamp, type);
+   tail = htobe32(stamp.pos + rms->output_buffer_samples + (uint32_t)rs->offset_samples);
+   memcpy(pkt->data + 16, &tail, sizeof(tail));
+   return pkt;
+@@ -3694,6 +3737,17 @@ packets_sync_send(struct raop_master_session *rms)
+ 
+ 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
+ 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
++
++	  {
++	    uint32_t anchor = be32toh(*(uint32_t *)(sync_pkt->data + 16));
++	    uint32_t playing = be32toh(*(uint32_t *)(sync_pkt->data + 4));
++
++	    DPRINTF(E_LOG, L_RAOP, "Start sync anchor for '%s': anchor=%" PRIu32 " next_packet=%" PRIu32 " (anchor lead %d samples = %d ms), playing=%" PRIu32 ", latency=%d samples (%d ms), input_buffer=%" PRIu32 " samples\n",
++	      rs->devname, anchor, rms->rtp_session->pos,
++	      (int)(anchor - rms->rtp_session->pos), (int)(anchor - rms->rtp_session->pos) * 1000 / 44100,
++	      playing, (int)(anchor - playing), (int)(anchor - playing) * 1000 / 44100,
++	      rms->input_buffer_samples);
++	  }
+ 	}
+       else if ((is_sync_time || rs->offset_sync_pending) && rs->state == RAOP_STATE_STREAMING)
+ 	{

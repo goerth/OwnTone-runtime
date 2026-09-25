@@ -1,0 +1,102 @@
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 9da9c48..835924a 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -37,6 +37,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <stdint.h>
+@@ -88,6 +89,12 @@
+ 
+ // See AIRPLAY_AUDIO_LATENCY_MS
+ #define RAOP_AUDIO_LATENCY_MS                250
++/* What native macOS AirPlay announces to an AirPlay 1 receiver, in samples at
++ * 44100 Hz: 250 ms and 2000 ms. The upper bound is what a positive playback
++ * offset has to fit under, together with the configured start buffer.
++ */
++#define RAOP_NATIVE_SDP_MIN_LATENCY          11025
++#define RAOP_NATIVE_SDP_MAX_LATENCY          88200
+ 
+ // How many RTP packets to buffer for retransmission
+ #define RAOP_PACKET_BUFFER_SIZE    1000
+@@ -1182,6 +1189,34 @@ raop_parse_auth(struct raop_session *rs, struct evrtsp_request *req)
+   return -1;
+ }
+ 
++/* A receiver clamps the playback latency we ask for to the range announced in
++ * the SDP, and it does so silently: every offset past the ceiling produces the
++ * same playout, which looks exactly like a delay setting that does nothing.
++ * The bounds are overridable so a receiver's real ceiling can be found without
++ * a rebuild - a value the receiver refuses, or ignores in favour of its own
++ * hardware buffer, is the answer this exists to get.
++ */
++static uint32_t
++raop_sdp_latency_bound(const char *name, uint32_t fallback)
++{
++  const char *value = getenv(name);
++  char *end;
++  unsigned long parsed;
++
++  if (!value || !*value)
++    return fallback;
++
++  errno = 0;
++  parsed = strtoul(value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Ignoring %s: '%s' is not a sample count, using %u\n", name, value, fallback);
++      return fallback;
++    }
++
++  return (uint32_t)parsed;
++}
++
+ static int
+ raop_add_headers(struct raop_session *rs, struct evrtsp_request *req, enum evrtsp_cmd_type req_method)
+ {
+@@ -1308,14 +1343,22 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
+   native_sdp_device = getenv("SOUNDFERRY_RAOP_NATIVE_SDP_DEVICE");
+   if (rs->native_compat || (native_sdp_device && strcmp(rs->devname, native_sdp_device) == 0))
+     {
+-      ret = evbuffer_add_printf(req->output_buffer, "a=min-latency:11025\r\na=max-latency:88200\r\n");
++      uint32_t min_latency = raop_sdp_latency_bound("SOUNDFERRY_RAOP_SDP_MIN_LATENCY", RAOP_NATIVE_SDP_MIN_LATENCY);
++      uint32_t max_latency = raop_sdp_latency_bound("SOUNDFERRY_RAOP_SDP_MAX_LATENCY", RAOP_NATIVE_SDP_MAX_LATENCY);
++
++      if (max_latency < min_latency)
++        max_latency = min_latency;
++
++      ret = evbuffer_add_printf(req->output_buffer, "a=min-latency:%u\r\na=max-latency:%u\r\n", min_latency, max_latency);
+       if (ret < 0)
+         {
+           DPRINTF(E_LOG, L_RAOP, "Out of memory for experimental SDP latency attributes\n");
+           return -1;
+         }
+ 
+-      DPRINTF(E_LOG, L_RAOP, "Experimental native SDP latency prepared for '%s': min=11025 max=88200\n", rs->devname);
++      DPRINTF(E_LOG, L_RAOP, "Experimental native SDP latency prepared for '%s': min=%u max=%u (headroom above a %u sample buffer: %d samples)\n",
++        rs->devname, min_latency, max_latency, rs->master_session ? rs->master_session->output_buffer_samples : 0,
++        rs->master_session ? (int)max_latency - (int)rs->master_session->output_buffer_samples : 0);
+     }
+ 
+   DPRINTF(E_INFO, L_RAOP, "Setting up AirPlay session %u (%s -> %s)\n", session_id, address, rs->address);
+@@ -3505,8 +3548,14 @@ packets_sync_send(struct raop_master_session *rms)
+ 	  if (rs->offset_sync_pending)
+ 	    {
+ 	      rs->offset_sync_pending = false;
+-	      DPRINTF(E_INFO, L_RAOP, "Sent immediate live offset sync to '%s': offset_samples=%d, type=0x%02x, pos=%" PRIu32 "\n",
+-		rs->devname, rs->offset_samples, sync_type, cur_stamp.pos);
++	      /* This is the number the receiver clamps to its announced range.
++	       * Printing it, rather than the offset alone, is what tells a
++	       * clamped setting apart from one that was never applied.
++	       */
++	      DPRINTF(E_INFO, L_RAOP, "Sent immediate live offset sync to '%s': offset_samples=%d, type=0x%02x, pos=%" PRIu32 ", requested_latency=%d samples (%d ms)\n",
++		rs->devname, rs->offset_samples, sync_type, cur_stamp.pos,
++		(int)rms->output_buffer_samples + rs->offset_samples,
++		((int)rms->output_buffer_samples + rs->offset_samples) * 1000 / 44100);
+ 	    }
+ 	}
+     }

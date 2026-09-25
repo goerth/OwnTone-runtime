@@ -1,0 +1,1127 @@
+--- a/src/player.c
++++ b/src/player.c
+@@ -99,7 +99,7 @@
+ // are divisible by 100, and because it keeps delay low.
+ // TODO sample rates of 22050 might cause underruns, since we would be reading
+ // only 100 x 220 = 22000 samples each second.
+-#define PLAYER_TICK_INTERVAL 10
++#define PLAYER_TICK_INTERVAL 30
+ 
+ // For every tick_interval, we will read a frame from the input buffer and
+ // write it to the outputs. If the input is empty, we will try to catch up next
+@@ -951,7 +951,7 @@
+   pb_session.bufsize = STOB(samples_per_read, quality->bits_per_sample, quality->channels);
+   pb_session.read_deficit_max = STOB(((uint64_t)quality->sample_rate * PLAYER_READ_BEHIND_MAX) / 1000, quality->bits_per_sample, quality->channels);
+ 
+-  DPRINTF(E_DBG, L_PLAYER, "New session values (q=%d/%d/%d, spr=%d, bufsize=%zu)\n",
++  DPRINTF(E_INFO, L_PLAYER, "New session values (q=%d/%d/%d, spr=%d, bufsize=%zu)\n",
+     quality->sample_rate, quality->bits_per_sample, quality->channels, samples_per_read, pb_session.bufsize);
+ 
+   if (pb_session.buffer)
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -45,6 +45,7 @@
+ #include <errno.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
++#include <sys/uio.h>
+ #include <netdb.h>
+ #include <fcntl.h>
+ #include <time.h>
+@@ -184,8 +185,57 @@
+   struct raop_master_session *next;
+ };
+ 
++/* BEGIN NATIVE STARTUP PURE POLICY */
++struct native_startup_gate
++{
++  bool sync_seen;
++  bool audio_started;
++  bool metadata_sent;
++  unsigned int timing_replies;
++  int64_t sync_ms;
++  int64_t audio_ms;
++};
++
++enum native_startup_action
++{
++  NATIVE_STARTUP_WAIT = 0,
++  NATIVE_STARTUP_AUDIO = 1,
++  NATIVE_STARTUP_FLUSH = 2,
++  NATIVE_STARTUP_METADATA = 4,
++  NATIVE_STARTUP_FAIL = 8,
++};
++
++static unsigned int
++native_startup_step(struct native_startup_gate *gate, int64_t now_ms)
++{
++  unsigned int action = NATIVE_STARTUP_AUDIO;
++  int64_t elapsed;
++
++  if (!gate->sync_seen)
++    return NATIVE_STARTUP_WAIT;
++  if (!gate->audio_started)
++    {
++      elapsed = now_ms - gate->sync_ms;
++      if (elapsed >= 5000 && gate->timing_replies == 0)
++        return NATIVE_STARTUP_FAIL;
++      if (elapsed < 300 || gate->timing_replies == 0)
++        return NATIVE_STARTUP_WAIT;
++      gate->audio_started = true;
++      gate->audio_ms = now_ms;
++      action |= NATIVE_STARTUP_FLUSH;
++    }
++  if (!gate->metadata_sent && now_ms - gate->audio_ms >= 1000)
++    {
++      gate->metadata_sent = true;
++      action |= NATIVE_STARTUP_METADATA;
++    }
++  return action;
++}
++/* END NATIVE STARTUP PURE POLICY */
++
+ struct raop_session
+ {
++  struct native_startup_gate native_startup;
+   uint64_t device_id;
+   int callback_id;
+ 
+@@ -202,10 +252,17 @@
+   bool supports_post;
+   bool supports_auth_setup;
+ 
++  bool native_compat;
++  bool native_challenge_sent;
++  bool native_artwork_cleared;
++  bool has_reported_audio_latency;
++  uint32_t reported_audio_latency;
+   bool only_probe;
+ 
+   struct event *deferredev;
+ 
++  unsigned int options_keep_alive_sent;
++  unsigned int options_keep_alive_acked;
+   int reqs_in_flight;
+   int cseq;
+   char *session;
+@@ -246,6 +303,8 @@
+ 
+ struct raop_metadata
+ {
++  bool live_pipe;
++  uint64_t persistent_id;
+   struct evbuffer *metadata;
+   struct evbuffer *artwork;
+   int artwork_fmt;
+@@ -343,6 +402,11 @@
+ static struct event *keep_alive_timer;
+ static struct timeval keep_alive_tv = { RAOP_KEEP_ALIVE_INTERVAL, 0 };
+ 
++/* Opt-in receiver-specific experiment; independent of metadata keep-alives. */
++static struct event *options_keep_alive_timer;
++static struct timeval options_keep_alive_tv = { 2, 0 };
++static const char *options_keep_alive_device;
++
+ /* Sessions */
+ static struct raop_master_session *raop_master_sessions;
+ static struct raop_session *raop_sessions;
+@@ -1127,11 +1191,12 @@
+ 
+   rs->cseq++;
+ 
+-  user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
++  user_agent = rs->native_compat ? "AirPlay/935.7.1" : cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
+   evrtsp_add_header(req->output_headers, "User-Agent", user_agent);
+ 
+   client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
+-  evrtsp_add_header(req->output_headers, "X-Apple-Client-Name", client_name);
++  if (!rs->native_compat)
++    evrtsp_add_header(req->output_headers, "X-Apple-Client-Name", client_name);
+ 
+   /* Add Authorization header */
+   url = (req_method == EVRTSP_REQ_OPTIONS) ? "*" : rs->session_url;
+@@ -1148,7 +1213,8 @@
+     }
+ 
+   snprintf(buf, sizeof(buf), "%" PRIX64, libhash);
+-  evrtsp_add_header(req->output_headers, "Client-Instance", buf);
++  if (!rs->native_compat)
++    evrtsp_add_header(req->output_headers, "Client-Instance", buf);
+   evrtsp_add_header(req->output_headers, "DACP-ID", buf);
+ 
+   // We set Active-Remote as 32 bit unsigned decimal, as at least my device
+@@ -1156,7 +1222,7 @@
+   snprintf(buf, sizeof(buf), "%" PRIu32, (uint32_t)rs->device_id);
+   evrtsp_add_header(req->output_headers, "Active-Remote", buf);
+ 
+-  if (rs->session)
++  if (rs->session && !rs->native_compat)
+     evrtsp_add_header(req->output_headers, "Session", rs->session);
+ 
+   /* Content-Length added automatically by evrtsp */
+@@ -1181,7 +1247,7 @@
+ #define SDP_PLD_FMT							\
+   "v=0\r\n"								\
+     "o=iTunes %u 0 IN %s %s\r\n"					\
+-    "s=iTunes\r\n"							\
++    "%s"							\
+     "c=IN %s %s\r\n"							\
+     "t=0 0\r\n"								\
+     "m=audio 0 RTP/AVP 96\r\n"						\
+@@ -1192,7 +1258,7 @@
+ #define SDP_PLD_FMT_NO_ENC						\
+   "v=0\r\n"								\
+     "o=iTunes %u 0 IN %s %s\r\n"					\
+-    "s=iTunes\r\n"							\
++    "%s"							\
+     "c=IN %s %s\r\n"							\
+     "t=0 0\r\n"								\
+     "m=audio 0 RTP/AVP 96\r\n"						\
+@@ -1201,6 +1267,7 @@
+ 
+   const char *af;
+   const char *rs_af;
++  const char *native_sdp_device;
+   char *p;
+   int ret;
+ 
+@@ -1214,11 +1281,11 @@
+   /* Add SDP payload - but don't add RSA/AES key/iv if no encryption - important for ATV3 update 6.0 */
+   if (rs->encrypt)
+     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
+-			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET,
++			      session_id, af, address, rs->native_compat ? "s=AirTunes\r\ni=SoundFerry audio stream\r\n" : "s=iTunes\r\n", rs_af, rs->address, RAOP_SAMPLES_PER_PACKET,
+ 			      raop_aes_key_b64, raop_aes_iv_b64);
+   else
+     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT_NO_ENC,
+-			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET);
++			      session_id, af, address, rs->native_compat ? "s=AirTunes\r\ni=SoundFerry audio stream\r\n" : "s=iTunes\r\n", rs_af, rs->address, RAOP_SAMPLES_PER_PACKET);
+ 
+   if (p)
+     *p = '%';
+@@ -1227,6 +1294,20 @@
+     {
+       DPRINTF(E_LOG, L_RAOP, "Out of memory for SDP payload\n");
+       return -1;
++    }
++
++  /* Opt-in comparison with SDP observed from native macOS AirPlay. */
++  native_sdp_device = getenv("SOUNDFERRY_RAOP_NATIVE_SDP_DEVICE");
++  if (rs->native_compat || (native_sdp_device && strcmp(rs->devname, native_sdp_device) == 0))
++    {
++      ret = evbuffer_add_printf(req->output_buffer, "a=min-latency:11025\r\na=max-latency:88200\r\n");
++      if (ret < 0)
++        {
++          DPRINTF(E_LOG, L_RAOP, "Out of memory for experimental SDP latency attributes\n");
++          return -1;
++        }
++
++      DPRINTF(E_LOG, L_RAOP, "Experimental native SDP latency prepared for '%s': min=11025 max=88200\n", rs->devname);
+     }
+ 
+   DPRINTF(E_INFO, L_RAOP, "Setting up AirPlay session %u (%s -> %s)\n", session_id, address, rs->address);
+@@ -1433,20 +1514,23 @@
+       return -1;
+     }
+ 
+-  evrtsp_add_header(req->output_headers, "Range", "npt=0-");
+-
+-  /* Start sequence: next sequence */
+-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
+-  if ((ret < 0) || (ret >= sizeof(buf)))
+-    {
+-      DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
+-
+-      evrtsp_request_free(req);
+-      return -1;
+-    }
+-  evrtsp_add_header(req->output_headers, "RTP-Info", buf);
+-
+-  DPRINTF(E_DBG, L_RAOP, "RTP-Info is %s\n", buf);
++  if (!rs->native_compat)
++    {
++      evrtsp_add_header(req->output_headers, "Range", "npt=0-");
++
++      /* Start sequence: next sequence */
++      ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
++      if ((ret < 0) || (ret >= sizeof(buf)))
++        {
++          DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in RECORD request\n");
++
++          evrtsp_request_free(req);
++          return -1;
++        }
++      evrtsp_add_header(req->output_headers, "RTP-Info", buf);
++
++      DPRINTF(E_DBG, L_RAOP, "RTP-Info is %s\n", buf);
++    }
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_RECORD, rs->session_url);
+   if (ret < 0)
+@@ -1486,8 +1570,8 @@
+     }
+ 
+   /* Request UDP transport, AirTunes v2 streaming */
+-  ret = snprintf(hdr, sizeof(hdr), "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=%u;timing_port=%u",
+-		 rs->control_svc->port, rs->timing_svc->port);
++  ret = snprintf(hdr, sizeof(hdr), "RTP/AVP/UDP;unicast;%smode=record;control_port=%u;timing_port=%u",
++                 rs->native_compat ? "" : "interleaved=0-1;", rs->control_svc->port, rs->timing_svc->port);
+   if ((ret < 0) || (ret >= sizeof(hdr)))
+     {
+       DPRINTF(E_LOG, L_RAOP, "Transport header exceeds buffer length\n");
+@@ -1509,14 +1593,31 @@
+   rs->reqs_in_flight++;
+ 
+   return 0;
++}
++
++static int
++raop_add_challenge(struct evrtsp_request *req)
++{
++  uint8_t challenge[16];
++  char *encoded;
++  char *padding;
++  int ret;
++
++  gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
++  encoded = b64_encode(challenge, sizeof(challenge));
++  if (!encoded)
++    return -1;
++  padding = strchr(encoded, '=');
++  if (padding)
++    *padding = '\0';
++  ret = evrtsp_add_header(req->output_headers, "Apple-Challenge", encoded);
++  free(encoded);
++  return ret;
+ }
+ 
+ static int
+ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb, const char *log_caller)
+ {
+-  uint8_t challenge[16];
+-  char *challenge_b64;
+-  char *ptr;
+   struct evrtsp_request *req;
+   char *address;
+   char *intf;
+@@ -1591,27 +1692,9 @@
+ 
+   evrtsp_add_header(req->output_headers, "Content-Type", "application/sdp");
+ 
+-  /* Challenge - but only if session is encrypted (important for ATV3 after update 6.0) */
+-  if (rs->encrypt)
+-    {
+-      gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
+-      challenge_b64 = b64_encode(challenge, sizeof(challenge));
+-      if (!challenge_b64)
+-	{
+-	  DPRINTF(E_LOG, L_RAOP, "Couldn't encode challenge\n");
+-
+-	  goto cleanup_req;
+-	}
+-
+-      /* Remove base64 padding */
+-      ptr = strchr(challenge_b64, '=');
+-      if (ptr)
+-	*ptr = '\0';
+-
+-      evrtsp_add_header(req->output_headers, "Apple-Challenge", challenge_b64);
+-
+-      free(challenge_b64);
+-    }
++  /* Profile sends its challenge in the first startup OPTIONS instead. */
++  if (rs->encrypt && !rs->native_compat && raop_add_challenge(req) < 0)
++    goto cleanup_req;
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_ANNOUNCE, rs->session_url);
+   if (ret < 0)
+@@ -1717,6 +1800,18 @@
+     {
+       evrtsp_request_free(req);
+       return -1;
++    }
++
++  if (rs->native_compat && rs->encrypt && !rs->only_probe && !rs->native_challenge_sent
++      && !(rs->state & RAOP_STATE_F_CONNECTED))
++    {
++      if (raop_add_challenge(req) < 0)
++        {
++          evrtsp_request_free(req);
++          return -1;
++        }
++      rs->native_challenge_sent = true;
++      DPRINTF(E_LOG, L_RAOP, "Experimental startup OPTIONS challenge prepared for '%s'\n", rs->devname);
+     }
+ 
+   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_OPTIONS, "*");
+@@ -2199,6 +2294,13 @@
+   CHECK_NULL(L_RAOP, rs->deferredev = evtimer_new(evbase_player, deferredev_cb, rs));
+ 
+   rs->devname = strdup(rd->name);
++  {
++    const char *native_device = getenv("SOUNDFERRY_RAOP_NATIVE_COMPAT_DEVICE");
++    rs->native_compat = native_device && strcmp(rd->name, native_device) == 0;
++    if (rs->native_compat)
++      DPRINTF(E_LOG, L_RAOP, "Experimental native wire compatibility profile enabled for '%s'\n", rd->name);
++  }
++
+   rs->volume = rd->volume;
+   rs->offset_samples = rd->offset_ms * rd->quality.sample_rate / 1000;
+ 
+@@ -2327,6 +2429,8 @@
+     }
+ 
+   CHECK_NULL(L_RAOP, rmd = calloc(1, sizeof(struct raop_metadata)));
++  rmd->live_pipe = queue_item->data_kind == DATA_KIND_PIPE;
++  rmd->persistent_id = queue_item->file_id;
+   CHECK_NULL(L_RAOP, rmd->artwork = evbuffer_new());
+   CHECK_NULL(L_RAOP, rmd->metadata = evbuffer_new());
+   CHECK_NULL(L_RAOP, tmp = evbuffer_new());
+@@ -2496,14 +2600,31 @@
+   size_t len;
+   int ret;
+ 
+-  buf = evbuffer_pullup(rmd->metadata, -1);
+-  len = evbuffer_get_length(rmd->metadata);
+-
+-  ret = evbuffer_add(evbuf, buf, len);
+-  if (ret != 0)
+-    {
+-      DPRINTF(E_LOG, L_RAOP, "Could not copy metadata for sending\n");
+-      return -1;
++  if (rs->native_compat && rmd->live_pipe)
++    {
++      /* Observed native live-audio metadata. caps=1 is a wire value, not
++       * an assertion that OwnTone's DACP playback-state enum uses 1. */
++      dmap_add_container(evbuf, "mlit", 74);
++      dmap_add_long(evbuf, "mper", rmd->persistent_id);
++      dmap_add_string(evbuf, "asal", "");
++      dmap_add_string(evbuf, "asar", "");
++      dmap_add_string(evbuf, "ascp", "");
++      dmap_add_string(evbuf, "asgn", "");
++      dmap_add_string(evbuf, "minm", "");
++      dmap_add_char(evbuf, "asdk", 0);
++      dmap_add_char(evbuf, "caps", 1);
++    }
++  else
++    {
++      buf = evbuffer_pullup(rmd->metadata, -1);
++      len = evbuffer_get_length(rmd->metadata);
++
++      ret = evbuffer_add(evbuf, buf, len);
++      if (ret != 0)
++        {
++          DPRINTF(E_LOG, L_RAOP, "Could not copy metadata for sending\n");
++          return -1;
++        }
+     }
+ 
+   ret = raop_send_req_set_parameter(rs, evbuf, "application/x-dmap-tagged", rtptime, raop_cb_metadata, "send_text");
+@@ -2536,13 +2657,23 @@
+ 
+   CHECK_NULL(L_RAOP, evbuf = evbuffer_new());
+ 
+-  if (rs->wanted_metadata & RAOP_MD_WANTS_PROGRESS)
++  if ((rs->wanted_metadata & RAOP_MD_WANTS_PROGRESS) && !(rs->native_compat && rmd->live_pipe))
+     {
+       ret = raop_metadata_send_progress(rs, evbuf, rmd, display, pos, end);
+       if (ret < 0)
+ 	goto error;
+     }
+ 
++  if (!only_progress && rs->native_compat && rmd->live_pipe && !rmd->artwork
++      && !rs->native_artwork_cleared && (rs->wanted_metadata & RAOP_MD_WANTS_ARTWORK))
++    {
++      ret = raop_send_req_set_parameter(rs, evbuf, "image/none", rtptime, raop_cb_metadata, "native_artwork_clear");
++      if (ret < 0)
++        goto error;
++      rs->native_artwork_cleared = true;
++      DPRINTF(E_LOG, L_RAOP, "Experimental empty artwork notification sent to '%s'\n", rs->devname);
++    }
++
+   if (!only_progress && (rs->wanted_metadata & RAOP_MD_WANTS_TEXT))
+     {
+       ret = raop_metadata_send_text(rs, evbuf, rmd, rtptime);
+@@ -2600,6 +2731,9 @@
+ 
+       if (!(rs->state & RAOP_STATE_F_CONNECTED) || !rs->wanted_metadata)
+ 	continue;
++
++      if (rs->native_compat && !rs->native_startup.metadata_sent)
++        continue;
+ 
+       ret = raop_metadata_send_generic(rs, metadata, false);
+       if (ret < 0)
+@@ -2799,6 +2933,63 @@
+   session_failure(rs);
+ }
+ 
++/* Do not use startup_options: it advances the session startup state. */
++static void
++raop_cb_options_keep_alive(struct evrtsp_request *req, void *arg)
++{
++  struct raop_session *rs = arg;
++
++  rs->reqs_in_flight--;
++
++  if (!req || raop_check_cseq(rs, req) < 0)
++    {
++      session_failure(rs);
++      return;
++    }
++
++  if (req->response_code != RTSP_OK)
++    DPRINTF(E_WARN, L_RAOP, "Experimental OPTIONS to '%s' returned %d (proceeding anyway)\n", rs->devname, req->response_code);
++  else if (rs->options_keep_alive_acked < 3)
++    {
++      rs->options_keep_alive_acked++;
++      DPRINTF(E_LOG, L_RAOP, "Experimental OPTIONS acknowledged by '%s' (%u/3 initial confirmations)\n", rs->devname, rs->options_keep_alive_acked);
++    }
++
++  if (!rs->reqs_in_flight)
++    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
++}
++
++static void
++raop_options_keep_alive_timer_cb(int fd, short what, void *arg)
++{
++  struct raop_session *rs;
++
++  if (!raop_sessions)
++    return;
++
++  for (rs = raop_sessions; rs; rs = rs->next)
++    {
++      if (rs->state != RAOP_STATE_STREAMING || rs->reqs_in_flight
++          || !(rs->native_compat || (options_keep_alive_device && strcmp(rs->devname, options_keep_alive_device) == 0)))
++        continue;
++
++      if (raop_send_req_options(rs, raop_cb_options_keep_alive, "Experimental keep-alive") < 0)
++        {
++          /* Defer destruction so the session-list iterator remains valid. */
++          deferred_session_failure(rs);
++          continue;
++        }
++
++      if (rs->options_keep_alive_sent < 3)
++        {
++          rs->options_keep_alive_sent++;
++          DPRINTF(E_LOG, L_RAOP, "Experimental OPTIONS sent to '%s' (%u/3 initial sends)\n", rs->devname, rs->options_keep_alive_sent);
++        }
++    }
++
++  evtimer_add(options_keep_alive_timer, &options_keep_alive_tv);
++}
++
+ static void
+ raop_keep_alive_timer_cb(int fd, short what, void *arg)
+ {
+@@ -2868,7 +3059,25 @@
+   if (!rs)
+     return -1;
+ 
+-  ret = send(rs->server_fd, pkt->data, pkt->data_len, 0);
++  if (rs->native_compat && pkt->data_len >= 12)
++    {
++      uint8_t header[12];
++      struct iovec iov[2];
++      struct msghdr msg = { 0 };
++
++      memcpy(header, pkt->data, sizeof(header));
++      header[1] &= 0x7f; // Native audio, including the first packet, has no marker.
++      memset(header + 8, 0, 4);
++      iov[0].iov_base = header;
++      iov[0].iov_len = sizeof(header);
++      iov[1].iov_base = pkt->data + sizeof(header);
++      iov[1].iov_len = pkt->data_len - sizeof(header);
++      msg.msg_iov = iov;
++      msg.msg_iovlen = 2;
++      ret = sendmsg(rs->server_fd, &msg, 0);
++    }
++  else
++    ret = send(rs->server_fd, pkt->data, pkt->data_len, 0);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Send error for '%s': %s\n", rs->devname, strerror(errno));
+@@ -2926,6 +3135,44 @@
+ }
+ 
+ static void
++udp_inventory_native_packet_resend(struct raop_session *rs, const struct rtp_packet *original)
++{
++  struct rtp_packet reply = { 0 };
++  uint16_t length_words;
++  static unsigned int logged;
++
++  /* Bound addition and the IPv4 UDP payload; RTP needs its complete base header. */
++  if (!original->data || original->data_len < 12 || original->data_len > 65503)
++    {
++      DPRINTF(E_WARN, L_RAOP, "Invalid cached RTP length for native retransmission\n");
++      return;
++    }
++  reply.data_len = original->data_len + 4;
++  reply.data = malloc(reply.data_len);
++  if (!reply.data)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Could not allocate native retransmission packet\n");
++      return;
++    }
++  reply.data[0] = 0x80;
++  reply.data[1] = 0xd6;
++  length_words = htobe16((uint16_t)(reply.data_len / 4 - 1));
++  memcpy(reply.data + 2, &length_words, sizeof(length_words));
++  memcpy(reply.data + 4, original->data, original->data_len);
++  /* Normal target audio uses SSRC zero; never mutate the shared cached packet. */
++  reply.data[5] &= 0x7f;
++  memset(reply.data + 12, 0, 4);
++  if (logged < 4)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Sending native retransmission: seq=%u count=1 socket=control\n",
++              ((unsigned int)original->data[2] << 8) | original->data[3]);
++      logged++;
++    }
++  control_packet_send(rs, &reply);
++  free(reply.data);
++}
++
++static void
+ packets_resend(struct raop_session *rs, uint16_t seqnum, int len)
+ {
+   struct rtp_session *rtp_session;
+@@ -2944,7 +3191,12 @@
+     {
+       pkt = rtp_packet_get(rtp_session, s);
+       if (pkt)
+-	packet_send(rs, pkt);
++        {
++          if (rs->native_compat)
++            udp_inventory_native_packet_resend(rs, pkt);
++          else
++            packet_send(rs, pkt);
++        }
+       else
+ 	pkt_missing = true;
+     }
+@@ -2954,6 +3206,23 @@
+       rs->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
+ }
+ 
++static void
++raop_cb_native_first_audio_flush(struct evrtsp_request *req, void *arg)
++{
++  struct raop_session *rs = arg;
++
++  rs->reqs_in_flight--;
++  if (!req || req->response_code != RTSP_OK)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Native startup audio-boundary FLUSH failed for '%s'\n", rs->devname);
++      session_failure(rs);
++      return;
++    }
++  DPRINTF(E_LOG, L_RAOP, "Native startup audio-boundary FLUSH acknowledged by '%s'\n", rs->devname);
++  if (!rs->reqs_in_flight)
++    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
++}
++
+ static int
+ packets_send(struct raop_master_session *rms)
+ {
+@@ -2983,6 +3252,53 @@
+     {
+       if (rs->master_session != rms)
+ 	continue;
++
++      if (rs->native_compat && (rs->state == RAOP_STATE_CONNECTED || rs->state == RAOP_STATE_STREAMING))
++        {
++          struct timespec now;
++          unsigned int action;
++
++          if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++            {
++              deferred_session_failure(rs);
++              continue;
++            }
++          action = native_startup_step(&rs->native_startup, (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000);
++          if (action & NATIVE_STARTUP_FAIL)
++            {
++              DPRINTF(E_LOG, L_RAOP, "Native startup timed out waiting for a timing reply to '%s' (got %u)\n", rs->devname, rs->native_startup.timing_replies);
++              deferred_session_failure(rs);
++              continue;
++            }
++          if (!(action & NATIVE_STARTUP_AUDIO))
++            continue;
++          if (action & NATIVE_STARTUP_FLUSH)
++            {
++              /* packet_next has not committed: these are this packet's exact seq/pos. */
++              if (raop_send_req_flush(rs, raop_cb_native_first_audio_flush, "native_first_audio") < 0)
++                {
++                  deferred_session_failure(rs);
++                  continue;
++                }
++              if (evrtsp_write_request_now(rs->ctrl, raop_cb_native_first_audio_flush, rs) != 1)
++                {
++                  DPRINTF(E_LOG, L_RAOP, "Native first-audio FLUSH could not complete immediately for '%s'; audio withheld\n", rs->devname);
++                  deferred_session_failure(rs);
++                  continue;
++                }
++              DPRINTF(E_LOG, L_RAOP, "Native first-audio FLUSH sent to '%s': seq=%" PRIu16 ";rtptime=%u timing=%u\n",
++                      rs->devname, rms->rtp_session->seqnum, rms->rtp_session->pos, rs->native_startup.timing_replies);
++            }
++          if (action & NATIVE_STARTUP_METADATA)
++            {
++              if (raop_metadata_startup_send(rs) < 0)
++                {
++                  deferred_session_failure(rs);
++                  continue;
++                }
++              DPRINTF(E_LOG, L_RAOP, "Native deferred startup metadata sent to '%s'\n", rs->devname);
++            }
++        }
+ 
+       // Device just joined
+       if (rs->state == RAOP_STATE_CONNECTED)
+@@ -3041,6 +3357,54 @@
+   rms->cur_stamp.pos = rms->rtp_session->pos + rms->input_buffer_samples - rms->output_buffer_samples;
+ }
+ 
++/* Optional per-device native synchronization comparison. Does not move the
++ * shared RTP/audio cursor. The same CLOCK_MONOTONIC source serves timing replies.
++ */
++static struct rtp_packet *
++udp_inventory_native_sync_next(struct raop_session *rs, struct raop_master_session *rms,
++                               struct rtcp_timestamp stamp, uint8_t type)
++{
++  const char *target = getenv("SOUNDFERRY_RAOP_NATIVE_COMPAT_DEVICE");
++  struct rtp_packet *pkt;
++  struct timespec now;
++  int64_t seconds, delta_ns;
++  uint32_t delta_frames, tail;
++  static bool fallback_logged;
++
++  if (!target || !*target || !rs->devname || strcmp(target, rs->devname) != 0
++      || rms->rtp_session->quality.sample_rate != 44100
++      || clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++    return rtp_sync_packet_next(rms->rtp_session, stamp, type);
++
++  /* Bound before multiplying; stale/future anchors retain the original mapping. */
++  seconds = (int64_t)now.tv_sec - (int64_t)stamp.ts.tv_sec;
++  if (seconds < -1 || seconds > 1)
++    goto fallback;
++  delta_ns = seconds * 1000000000LL + now.tv_nsec - stamp.ts.tv_nsec;
++  if (delta_ns < 0 || delta_ns > 100000000LL)
++    goto fallback;
++
++  delta_frames = (uint32_t)(delta_ns * 44100 / 1000000000LL);
++  stamp.pos += delta_frames;
++  stamp.ts = now;
++  pkt = rtp_sync_packet_next(rms->rtp_session, stamp, type);
++  /* Retain the user's per-speaker offset; native zero-offset lead is 1750 ms.
++   * stamp already includes -offset_samples. Restore it only in the tail, so
++   * the configured offset continues changing playout relative to source time.
++   */
++  tail = htobe32(stamp.pos + rms->output_buffer_samples + (uint32_t)rs->offset_samples);
++  memcpy(pkt->data + 16, &tail, sizeof(tail));
++  return pkt;
++
++ fallback:
++  if (!fallback_logged)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Native sync extrapolation skipped: player timestamp is future or more than 100 ms old\n");
++      fallback_logged = true;
++    }
++  return rtp_sync_packet_next(rms->rtp_session, stamp, type);
++}
++
+ static void
+ packets_sync_send(struct raop_master_session *rms)
+ {
+@@ -3069,15 +3433,33 @@
+       // A device has joined and should get an init sync packet
+       if (rs->state == RAOP_STATE_CONNECTED)
+ 	{
+-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
++	  sync_pkt = udp_inventory_native_sync_next(rs, rms, cur_stamp, 0x90);
++	  // Local comparison: match the observed macOS AirPlay 1 sync header.
++	  if (rs->native_compat)
++	    sync_pkt->data[3] = 0x04;
+ 	  control_packet_send(rs, sync_pkt);
++          if (rs->native_compat && !rs->native_startup.sync_seen)
++            {
++              struct timespec sync_now;
++              if (clock_gettime(CLOCK_MONOTONIC, &sync_now) == 0)
++                {
++                  rs->native_startup.sync_seen = true;
++                  rs->native_startup.sync_ms = (int64_t)sync_now.tv_sec * 1000 + sync_now.tv_nsec / 1000000;
++                }
++              else
++                deferred_session_failure(rs);
++            }
++
+ 
+ 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
+ 	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
+ 	}
+       else if (is_sync_time && rs->state == RAOP_STATE_STREAMING)
+ 	{
+-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80);
++	  sync_pkt = udp_inventory_native_sync_next(rs, rms, cur_stamp, 0x80);
++	  // Local comparison: match the observed macOS AirPlay 1 sync header.
++	  if (rs->native_compat)
++	    sync_pkt->data[3] = 0x04;
+ 	  control_packet_send(rs, sync_pkt);
+ 	}
+     }
+@@ -3142,6 +3524,53 @@
+  error:
+   service_stop(svc);
+   return -1;
++}
++
++/* The timing socket is shared, but callbacks run serially on one event loop.
++ * With this opt-in profile enabled, explicitly set every IPv4 reply's TOS and
++ * restore zero after sending. Never send if the required setting failed.
++ */
++static int
++udp_inventory_timing_send(int fd, const uint8_t *data, size_t len,
++                          union net_sockaddr *peer, socklen_t peer_len)
++{
++  const char *target = getenv("SOUNDFERRY_RAOP_NATIVE_COMPAT_DEVICE");
++  struct raop_session *rs;
++  int tos, zero = 0, ret, send_errno, observed;
++  socklen_t opt_len;
++
++  if (!target || !*target || peer->sa.sa_family != AF_INET)
++    return sendto(fd, data, len, 0, &peer->sa, peer_len);
++
++  rs = session_find_by_address(peer);
++  tos = (rs && rs->devname && strcmp(target, rs->devname) == 0) ? 0xc0 : 0;
++  if (setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Could not set timing reply TOS; skipping reply: %s\n", strerror(errno));
++      return -1;
++    }
++  opt_len = sizeof(observed);
++  if (getsockopt(fd, IPPROTO_IP, IP_TOS, &observed, &opt_len) < 0 || observed != tos)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Could not verify timing reply TOS; skipping reply\n");
++      if (setsockopt(fd, IPPROTO_IP, IP_TOS, &zero, sizeof(zero)) < 0)
++        DPRINTF(E_LOG, L_RAOP, "Could not restore timing socket TOS: %s\n", strerror(errno));
++      errno = EIO;
++      return -1;
++    }
++
++  ret = sendto(fd, data, len, 0, &peer->sa, peer_len);
++  send_errno = errno;
++  if (setsockopt(fd, IPPROTO_IP, IP_TOS, &zero, sizeof(zero)) < 0)
++    DPRINTF(E_LOG, L_RAOP, "Could not restore timing socket TOS; next reply must set and verify its own TOS: %s\n", strerror(errno));
++  else
++    {
++      opt_len = sizeof(observed);
++      if (getsockopt(fd, IPPROTO_IP, IP_TOS, &observed, &opt_len) < 0 || observed != 0)
++        DPRINTF(E_LOG, L_RAOP, "Could not verify restored timing socket TOS; next reply must set and verify its own TOS\n");
++    }
++  errno = send_errno;
++  return ret;
+ }
+ 
+ static void
+@@ -3188,6 +3617,7 @@
+   res[0] = 0x80;
+   res[1] = 0xd3;
+   res[2] = req[2];
++  res[3] = req[3];
+ 
+   /* Copy client timestamp */
+   memcpy(res + 8, req + 24, 8);
+@@ -3218,12 +3648,19 @@
+       memcpy(res + 28, &xmit_stamp.frac, 4);
+     }
+ 
+-  ret = sendto(fd, res, sizeof(res), 0, &peer_addr.sa, peer_addrlen);
++  ret = udp_inventory_timing_send(fd, res, sizeof(res), &peer_addr, peer_addrlen);
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not send timing reply: %s\n", strerror(errno));
+       return;
+     }
++  if (ret == sizeof(res))
++    {
++      struct raop_session *rs = session_find_by_address(&peer_addr);
++      if (rs && rs->native_compat && rs->native_startup.timing_replies < 3)
++        rs->native_startup.timing_replies++;
++    }
++
+ }
+ 
+ static void
+@@ -3366,29 +3803,13 @@
+   session_failure(rs);
+ }
+ 
++/* Shared completion after initial volume and optional experimental FLUSH. */
+ static void
+-raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
+-{
+-  struct raop_session *rs = arg;
+-  int ret;
+-
+-  rs->reqs_in_flight--;
+-
+-  if (!req)
+-    goto cleanup;
+-
+-  if (req->response_code != RTSP_OK)
+-    {
+-      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", req->response_code, req->response_code_line);
+-
+-      goto cleanup;
+-    }
+-
+-  ret = raop_check_cseq(rs, req);
+-  if (ret < 0)
+-    goto cleanup;
+-
+-  ret = raop_metadata_startup_send(rs);
++raop_startup_finish(struct raop_session *rs)
++{
++  int ret;
++
++  ret = rs->native_compat ? 0 : raop_metadata_startup_send(rs);
+   if (ret < 0)
+     goto cleanup;
+ 
+@@ -3411,6 +3832,127 @@
+ }
+ 
+ static void
++raop_cb_startup_flush(struct evrtsp_request *req, void *arg)
++{
++  struct raop_session *rs = arg;
++
++  rs->reqs_in_flight--;
++
++  if (!req || req->response_code != RTSP_OK || raop_check_cseq(rs, req) < 0)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Experimental startup FLUSH failed for '%s'\n", rs->devname);
++      raop_startup_cancel(rs);
++      return;
++    }
++
++  DPRINTF(E_LOG, L_RAOP, "Experimental startup FLUSH acknowledged by '%s'\n", rs->devname);
++  raop_startup_finish(rs);
++}
++
++static void
++raop_cb_startup_volume(struct evrtsp_request *req, void *arg)
++{
++  struct raop_session *rs = arg;
++  const char *flush_device;
++  int ret;
++
++  rs->reqs_in_flight--;
++
++  if (!req)
++    goto cleanup;
++
++  if (req->response_code != RTSP_OK)
++    {
++      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", req->response_code, req->response_code_line);
++
++      goto cleanup;
++    }
++
++  ret = raop_check_cseq(rs, req);
++  if (ret < 0)
++    goto cleanup;
++
++  flush_device = getenv("SOUNDFERRY_RAOP_STARTUP_FLUSH_DEVICE");
++  if (!rs->native_compat && flush_device && strcmp(rs->devname, flush_device) == 0)
++    {
++      ret = raop_send_req_flush(rs, raop_cb_startup_flush, "Experimental startup flush");
++      if (ret < 0)
++        goto cleanup;
++
++      DPRINTF(E_LOG, L_RAOP, "Experimental startup FLUSH sent to '%s': seq=%" PRIu16 ";rtptime=%u\n",
++              rs->devname, rs->master_session->rtp_session->seqnum, rs->master_session->rtp_session->pos);
++      return;
++    }
++
++  raop_startup_finish(rs);
++  return;
++
++ cleanup:
++  raop_startup_cancel(rs);
++}
++
++static bool
++raop_audio_latency_parse(const char *value, uint32_t *latency)
++{
++  uint64_t parsed = 0;
++  size_t digits = 0;
++
++  while (*value == ' ' || *value == '\t')
++    value++;
++  while (*value >= '0' && *value <= '9')
++    {
++      if (++digits > 10)
++        return false;
++      parsed = parsed * 10 + (*value++ - '0');
++      if (parsed > UINT32_MAX)
++        return false;
++    }
++  while (*value == ' ' || *value == '\t' || *value == '\r')
++    value++;
++  if (!digits || *value)
++    return false;
++  *latency = (uint32_t)parsed;
++  return true;
++}
++
++static void
++raop_record_latency_observe(struct raop_session *rs, struct evrtsp_request *req)
++{
++  const char *value = evrtsp_find_header(req->input_headers, "Audio-Latency");
++  const char *ctype;
++  char body[257];
++  char *line;
++  char *next;
++  size_t len;
++
++  rs->has_reported_audio_latency = value && raop_audio_latency_parse(value, &rs->reported_audio_latency);
++  ctype = evrtsp_find_header(req->input_headers, "Content-Type");
++  len = evbuffer_get_length(req->input_buffer);
++  if (!rs->has_reported_audio_latency && ctype && strcasecmp(ctype, "text/parameters") == 0
++      && len && len < sizeof(body) && evbuffer_copyout(req->input_buffer, body, len) == len)
++    {
++      if (memchr(body, '\0', len))
++        return;
++      body[len] = '\0';
++      for (line = body; line; line = next)
++        {
++          next = strchr(line, '\n');
++          if (next)
++            *next++ = '\0';
++          if (strncasecmp(line, "Audio-Latency:", 14) == 0
++              && raop_audio_latency_parse(line + 14, &rs->reported_audio_latency))
++            {
++              rs->has_reported_audio_latency = true;
++              break;
++            }
++        }
++    }
++
++  if (rs->has_reported_audio_latency)
++    DPRINTF(E_LOG, L_RAOP, "Receiver '%s' reported Audio-Latency=%u (diagnostic only)\n", rs->devname, rs->reported_audio_latency);
++}
++
++static void
+ raop_cb_startup_record(struct evrtsp_request *req, void *arg)
+ {
+   struct raop_session *rs = arg;
+@@ -3432,6 +3974,9 @@
+   ret = raop_check_cseq(rs, req);
+   if (ret < 0)
+     goto cleanup;
++
++  if (rs->native_compat)
++    raop_record_latency_observe(rs, req);
+ 
+   /* Audio latency */
+   param = evrtsp_find_header(req->input_headers, "Audio-Latency");
+@@ -4632,6 +5177,10 @@
+       if (!event_pending(keep_alive_timer, EV_TIMEOUT, NULL))
+ 	evtimer_add(keep_alive_timer, &keep_alive_tv);
+ 
++      if ((rs->native_compat || (options_keep_alive_device && strcmp(rs->devname, options_keep_alive_device) == 0))
++          && !event_pending(options_keep_alive_timer, EV_TIMEOUT, NULL))
++        evtimer_add(options_keep_alive_timer, &options_keep_alive_tv);
++
+       rs->state = RAOP_STATE_STREAMING;
+       // Make a cb?
+     }
+@@ -4696,6 +5245,13 @@
+     *ptr = '\0';
+ 
+   CHECK_NULL(L_RAOP, keep_alive_timer = evtimer_new(evbase_player, raop_keep_alive_timer_cb, NULL));
++  CHECK_NULL(L_RAOP, options_keep_alive_timer = evtimer_new(evbase_player, raop_options_keep_alive_timer_cb, NULL));
++  options_keep_alive_device = getenv("SOUNDFERRY_RAOP_OPTIONS_KEEPALIVE_DEVICE");
++  if (options_keep_alive_device && !options_keep_alive_device[0])
++    options_keep_alive_device = NULL;
++  if (options_keep_alive_device)
++    DPRINTF(E_LOG, L_RAOP, "Experimental 2-second playback OPTIONS enabled for '%s'\n", options_keep_alive_device);
++
+ 
+   ret = service_start(&raop_timing_svc, timing_svc_cb, 0, "RAOP timing");
+   if (ret < 0)
+@@ -4730,6 +5286,7 @@
+  out_stop_timing:
+   service_stop(&raop_timing_svc);
+  out_free_timer:
++  event_free(options_keep_alive_timer);
+   event_free(keep_alive_timer);
+   free(raop_aes_iv_b64);
+  out_free_b64_key:
+@@ -4748,6 +5305,7 @@
+   service_stop(&raop_control_svc);
+   service_stop(&raop_timing_svc);
+ 
++  event_free(options_keep_alive_timer);
+   event_free(keep_alive_timer);
+ 
+   for (rs = raop_sessions; raop_sessions; rs = raop_sessions)
+--- a/src/evrtsp/rtsp.c
++++ b/src/evrtsp/rtsp.c
+@@ -670,6 +670,39 @@
+ }
+ 
+ 
++/* BEGIN IMMEDIATE REQUEST WRITE */
++int
++evrtsp_write_request_now(struct evrtsp_connection *evcon,
++    void (*expected_cb)(struct evrtsp_request *, void *), void *expected_arg)
++{
++  struct evrtsp_request *req;
++  int flags, written;
++
++  if (!evcon || evcon->state != EVCON_WRITING || evcon->fd < 0
++      || evcon->cb != evrtsp_write_connectioncb)
++    return 0;
++  req = TAILQ_FIRST(&evcon->requests);
++  if (!req || req->type != EVRTSP_REQ_FLUSH || req->cb != expected_cb || req->cb_arg != expected_arg)
++    return 0;
++  flags = fcntl(evcon->fd, F_GETFL, 0);
++  if (flags < 0 || !(flags & O_NONBLOCK))
++    return 0;
++
++  /* One nonblocking write only. Caller must destroy this connection on 0/-1;
++   * do not let the ordinary writer finish a partially emitted request later. */
++  event_del(&evcon->ev);
++  written = evbuffer_write(evcon->output_raw, evcon->fd);
++  if (written <= 0 || evbuffer_get_length(evcon->output_raw) != 0)
++    return written < 0 && errno != EAGAIN && errno != EWOULDBLOCK ? -1 : 0;
++
++  /* This internal callback only switches to response reading. No request/user
++   * callback is invoked, and no connection access follows the callback. */
++  evrtsp_write_connectioncb(evcon, NULL);
++  return 1;
++}
++/* END IMMEDIATE REQUEST WRITE */
++
++
+ 
+ /*
+  * Clean up a connection object
+--- a/src/evrtsp/evrtsp.h
++++ b/src/evrtsp/evrtsp.h
+@@ -167,6 +167,11 @@
+     struct evrtsp_request *req,
+     enum evrtsp_cmd_type type, const char *uri);
+ 
++/* Experimental FLUSH-only immediate write: 1 fully sent, 0 incomplete/not
++ * eligible, -1 write error. Caller must close on failure. Does not await ACK. */
++int evrtsp_write_request_now(struct evrtsp_connection *evcon,
++    void (*expected_cb)(struct evrtsp_request *, void *), void *expected_arg);
++
+ const char *evrtsp_request_uri(struct evrtsp_request *req);
+ 
+ /* Interfaces for dealing with headers */

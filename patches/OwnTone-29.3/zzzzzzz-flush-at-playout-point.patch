@@ -1,0 +1,116 @@
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 9b83965..3643a59 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -297,6 +297,16 @@ struct raop_session
+   /* A changed offset owes this session a FLUSH before that sync packet. */
+   bool offset_reanchor_pending;
+ 
++  /* The next FLUSH names this point instead of the write head. A FLUSH is
++   * normally sent before any audio, where the two are the same; mid-stream the
++   * write head is a whole start buffer ahead of what the receiver is playing,
++   * and a FLUSH for a point it has not reached is one it can acknowledge
++   * without doing anything.
++   */
++  bool flush_point_valid;
++  uint16_t flush_point_seq;
++  uint32_t flush_point_rtptime;
++
+   /* Diagnostics only: how often this receiver has asked for lost audio. */
+   uint64_t resend_requests;
+   uint64_t resend_packets;
+@@ -1466,7 +1476,13 @@ raop_send_req_flush(struct raop_session *rs, evrtsp_req_cb cb, const char *log_c
+     }
+ 
+   /* Restart sequence */
+-  ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
++  if (rs->flush_point_valid)
++    {
++      rs->flush_point_valid = false;
++      ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rs->flush_point_seq, rs->flush_point_rtptime);
++    }
++  else
++    ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
+   if ((ret < 0) || (ret >= sizeof(buf)))
+     {
+       DPRINTF(E_LOG, L_RAOP, "RTP-Info too big for buffer in FLUSH request\n");
+@@ -3369,7 +3385,27 @@ packets_send(struct raop_master_session *rms)
+               /* Same boundary the startup FLUSH uses: packet_next has not
+                * committed, so these are this packet's exact seq/pos.
+                */
++              uint32_t play_pos = rms->cur_stamp.pos - (uint32_t)rs->offset_samples;
++              uint32_t behind = rms->rtp_session->pos - play_pos;
++
+               rs->offset_reanchor_pending = false;
++
++              /* Name the point the following sync packet will call "now
++               * playing", so the FLUSH and the sync cannot contradict each
++               * other. Sequence numbers run one per samples_per_packet.
++               */
++              /* behind is a wrapped subtraction; only a plausible lag means the
++               * playout point was computed from a live stamp.
++               */
++              if (rms->samples_per_packet > 0 && behind > 0 && behind < 10 * rms->rtp_session->quality.sample_rate)
++                {
++                  rs->flush_point_rtptime = play_pos;
++                  rs->flush_point_seq = (uint16_t)(rms->rtp_session->seqnum - behind / rms->samples_per_packet);
++                  rs->flush_point_valid = true;
++                  DPRINTF(E_INFO, L_RAOP, "Live offset FLUSH will name the playout point for '%s': seq=%" PRIu16 ";rtptime=%u (write head is %u samples ahead)\n",
++                    rs->devname, rs->flush_point_seq, rs->flush_point_rtptime, behind);
++                }
++
+               if (raop_send_req_flush(rs, raop_cb_offset_reanchor_flush, "live_offset") < 0)
+                 rs->offset_sync_pending = true;
+               else if (evrtsp_write_request_now(rs->ctrl, raop_cb_offset_reanchor_flush, rs) != 1)
+@@ -3509,6 +3545,33 @@ enum raop_live_offset_mode
+   LIVE_OFFSET_FLUSH,    // flush: an RTSP FLUSH, then that 0x90 packet
+ };
+ 
++/* Upstream sends 0x07 here, the value iTunes uses, which shairport-sync's
++ * rtp.c reads as telling the receiver to add an 11025 sample latency of its
++ * own; 0x04 is what pure AirPlay sends and does not. The native compatibility
++ * profile picked 0x04 to match a captured macOS session. If a receiver takes
++ * its latency from this byte rather than from the packet's own timestamps,
++ * that choice decides whether an offset can reach it at all, so it is settable
++ * with SOUNDFERRY_RAOP_NATIVE_SYNC_FLAG.
++ */
++static uint8_t
++raop_native_sync_flag(void)
++{
++  static bool resolved;
++  static uint8_t flag;
++  const char *value;
++
++  if (resolved)
++    return flag;
++
++  value = getenv("SOUNDFERRY_RAOP_NATIVE_SYNC_FLAG");
++  flag = (value && *value) ? (uint8_t)strtoul(value, NULL, 0) : 0x04;
++  resolved = true;
++
++  DPRINTF(E_LOG, L_RAOP, "Native sync packets will carry flag byte 0x%02x\n", flag);
++
++  return flag;
++}
++
+ static enum raop_live_offset_mode
+ raop_live_offset_mode(void)
+ {
+@@ -3566,7 +3629,7 @@ packets_sync_send(struct raop_master_session *rms)
+ 	  sync_pkt = udp_inventory_native_sync_next(rs, rms, cur_stamp, 0x90);
+ 	  // Local comparison: match the observed macOS AirPlay 1 sync header.
+ 	  if (rs->native_compat)
+-	    sync_pkt->data[3] = 0x04;
++	    sync_pkt->data[3] = raop_native_sync_flag();
+ 	  control_packet_send(rs, sync_pkt);
+           if (rs->native_compat && !rs->native_startup.sync_seen)
+             {
+@@ -3599,7 +3662,7 @@ packets_sync_send(struct raop_master_session *rms)
+ 	  sync_pkt = udp_inventory_native_sync_next(rs, rms, cur_stamp, sync_type);
+ 	  // Local comparison: match the observed macOS AirPlay 1 sync header.
+ 	  if (rs->native_compat)
+-	    sync_pkt->data[3] = 0x04;
++	    sync_pkt->data[3] = raop_native_sync_flag();
+ 	  control_packet_send(rs, sync_pkt);
+ 
+ 	  if (rs->offset_sync_pending)

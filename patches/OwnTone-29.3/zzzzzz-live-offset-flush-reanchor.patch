@@ -1,0 +1,139 @@
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 835924a..9b83965 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -294,6 +294,9 @@ struct raop_session
+   /* A changed offset owes this session one immediate sync packet. */
+   bool offset_sync_pending;
+ 
++  /* A changed offset owes this session a FLUSH before that sync packet. */
++  bool offset_reanchor_pending;
++
+   /* Diagnostics only: how often this receiver has asked for lost audio. */
+   uint64_t resend_requests;
+   uint64_t resend_packets;
+@@ -3274,6 +3277,27 @@ raop_cb_native_first_audio_flush(struct evrtsp_request *req, void *arg)
+     evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
+ }
+ 
++/* Unlike the startup FLUSH, a failure here is not fatal: the stream is already
++ * playing and only the delay adjustment is lost. The sync packet still goes
++ * out, so a receiver that does honour it is not held back by a refused FLUSH.
++ */
++static void
++raop_cb_offset_reanchor_flush(struct evrtsp_request *req, void *arg)
++{
++  struct raop_session *rs = arg;
++
++  rs->reqs_in_flight--;
++  rs->offset_sync_pending = true;
++
++  if (!req || req->response_code != RTSP_OK)
++    DPRINTF(E_LOG, L_RAOP, "Live offset FLUSH was refused by '%s'; sending the sync packet alone\n", rs->devname);
++  else
++    DPRINTF(E_INFO, L_RAOP, "Live offset FLUSH acknowledged by '%s'; re-anchor sync queued\n", rs->devname);
++
++  if (!rs->reqs_in_flight)
++    evrtsp_connection_set_closecb(rs->ctrl, raop_rtsp_close_cb, rs);
++}
++
+ static int
+ packets_send(struct raop_master_session *rms)
+ {
+@@ -3340,6 +3364,20 @@ packets_send(struct raop_master_session *rms)
+               DPRINTF(E_LOG, L_RAOP, "Native first-audio FLUSH sent to '%s': seq=%" PRIu16 ";rtptime=%u timing=%u\n",
+                       rs->devname, rms->rtp_session->seqnum, rms->rtp_session->pos, rs->native_startup.timing_replies);
+             }
++          if (rs->offset_reanchor_pending && rs->state == RAOP_STATE_STREAMING)
++            {
++              /* Same boundary the startup FLUSH uses: packet_next has not
++               * committed, so these are this packet's exact seq/pos.
++               */
++              rs->offset_reanchor_pending = false;
++              if (raop_send_req_flush(rs, raop_cb_offset_reanchor_flush, "live_offset") < 0)
++                rs->offset_sync_pending = true;
++              else if (evrtsp_write_request_now(rs->ctrl, raop_cb_offset_reanchor_flush, rs) != 1)
++                DPRINTF(E_LOG, L_RAOP, "Live offset FLUSH to '%s' could not be written immediately; it stays queued\n", rs->devname);
++              else
++                DPRINTF(E_INFO, L_RAOP, "Live offset FLUSH sent to '%s': seq=%" PRIu16 ";rtptime=%u\n",
++                  rs->devname, rms->rtp_session->seqnum, rms->rtp_session->pos);
++            }
+           if (action & NATIVE_STARTUP_METADATA)
+             {
+               if (raop_metadata_startup_send(rs) < 0)
+@@ -3456,26 +3494,45 @@ udp_inventory_native_sync_next(struct raop_session *rs, struct raop_master_sessi
+   return rtp_sync_packet_next(rms->rtp_session, stamp, type);
+ }
+ 
+-/* Opt in with SOUNDFERRY_RAOP_LIVE_OFFSET_REANCHOR=1 to send the re-anchor
+- * sync packet instead of the routine one when the offset changes.
++/* How a changed offset is delivered to an AirPlay 1 receiver, chosen with
++ * SOUNDFERRY_RAOP_LIVE_OFFSET_REANCHOR. Measured on an AirPort Express: a
++ * receiver may take its playout schedule only when a stream starts, and treat
++ * every later sync packet as a clock reference alone. Such a receiver ignores
++ * both LIVE_OFFSET_SYNC and LIVE_OFFSET_REANCHOR no matter what latency they
++ * ask for, and only LIVE_OFFSET_FLUSH moves it - at the cost of the audio the
++ * receiver has buffered, which it drops.
+  */
+-static bool
+-raop_live_offset_reanchors(void)
++enum raop_live_offset_mode
++{
++  LIVE_OFFSET_SYNC,     // 0: the routine 0x80 sync packet
++  LIVE_OFFSET_REANCHOR, // 1: the 0x90 sync packet a stream starts on
++  LIVE_OFFSET_FLUSH,    // flush: an RTSP FLUSH, then that 0x90 packet
++};
++
++static enum raop_live_offset_mode
++raop_live_offset_mode(void)
+ {
+   static bool resolved;
+-  static bool reanchor;
++  static enum raop_live_offset_mode mode;
+   const char *value;
+ 
+   if (resolved)
+-    return reanchor;
++    return mode;
+ 
+   value = getenv("SOUNDFERRY_RAOP_LIVE_OFFSET_REANCHOR");
+-  reanchor = (value && *value && strcmp(value, "0") != 0);
++  if (!value || !*value || strcmp(value, "0") == 0)
++    mode = LIVE_OFFSET_SYNC;
++  else if (strcasecmp(value, "flush") == 0)
++    mode = LIVE_OFFSET_FLUSH;
++  else
++    mode = LIVE_OFFSET_REANCHOR;
+   resolved = true;
+ 
+-  DPRINTF(E_LOG, L_RAOP, "Live offset changes will be sent as %s sync packets\n", reanchor ? "re-anchor (0x90)" : "routine (0x80)");
++  DPRINTF(E_LOG, L_RAOP, "Live offset changes will be delivered by %s\n",
++    mode == LIVE_OFFSET_FLUSH ? "FLUSH then a re-anchor (0x90) sync packet"
++      : mode == LIVE_OFFSET_REANCHOR ? "a re-anchor (0x90) sync packet" : "the routine (0x80) sync packet");
+ 
+-  return reanchor;
++  return mode;
+ }
+ 
+ static void
+@@ -3536,7 +3593,7 @@ packets_sync_send(struct raop_master_session *rms)
+ 	   * told to re-anchor on. Which one an AirPlay 1 receiver honours for a
+ 	   * live offset change is what this switch exists to measure.
+ 	   */
+-	  if (rs->offset_sync_pending && raop_live_offset_reanchors())
++	  if (rs->offset_sync_pending && raop_live_offset_mode() != LIVE_OFFSET_SYNC)
+ 	    sync_type = 0x90;
+ 
+ 	  sync_pkt = udp_inventory_native_sync_next(rs, rms, cur_stamp, sync_type);
+@@ -5389,7 +5446,10 @@ raop_device_offset_set(struct output_device *device)
+   int previous_offset_samples = rs->offset_samples;
+ 
+   rs->offset_samples = device->offset_ms * device->quality.sample_rate / 1000;
+-  rs->offset_sync_pending = true;
++  if (raop_live_offset_mode() == LIVE_OFFSET_FLUSH && rs->native_compat && rs->state == RAOP_STATE_STREAMING)
++    rs->offset_reanchor_pending = true; // the FLUSH callback queues the sync
++  else
++    rs->offset_sync_pending = true;
+ 
+   DPRINTF(E_INFO, L_RAOP,
+     "Updated live offset for '%s': offset_ms=%d, offset_samples=%d, previous_offset_samples=%d; immediate sync queued\n",

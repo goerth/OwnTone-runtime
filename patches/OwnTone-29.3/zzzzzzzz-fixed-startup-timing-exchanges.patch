@@ -1,0 +1,93 @@
+diff --git a/src/outputs/raop.c b/src/outputs/raop.c
+index 3643a59..2596685 100644
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -201,6 +201,12 @@ struct native_startup_gate
+   unsigned int timing_replies;
+   int64_t sync_ms;
+   int64_t audio_ms;
++  /* How many timing exchanges the receiver should have completed before audio
++   * is released, and how long to wait for them. Zero in either field means the
++   * original policy: one exchange, no extra waiting.
++   */
++  unsigned int required_timing_replies;
++  int64_t timing_wait_ms;
+ };
+ 
+ enum native_startup_action
+@@ -227,6 +233,16 @@ native_startup_step(struct native_startup_gate *gate, int64_t now_ms)
+         return NATIVE_STARTUP_FAIL;
+       if (elapsed < 300 || gate->timing_replies == 0)
+         return NATIVE_STARTUP_WAIT;
++      /* A receiver schedules playout once, from the clock estimate it holds at
++       * this moment, and never revises it for the rest of the stream. Releasing
++       * audio after whichever number of exchanges happens to have landed makes
++       * that estimate - and so the speaker's position - different on every
++       * reconnect. Waiting for a fixed number makes each reconnect start from
++       * the same place. The wait is bounded because a receiver that stops
++       * answering must not hold audio forever.
++       */
++      if (gate->timing_replies < gate->required_timing_replies && elapsed < gate->timing_wait_ms)
++        return NATIVE_STARTUP_WAIT;
+       gate->audio_started = true;
+       gate->audio_ms = now_ms;
+       action |= NATIVE_STARTUP_FLUSH;
+@@ -1209,6 +1225,30 @@ raop_parse_auth(struct raop_session *rs, struct evrtsp_request *req)
+  * a rebuild - a value the receiver refuses, or ignores in favour of its own
+  * hardware buffer, is the answer this exists to get.
+  */
++/* Reads a bounded unsigned setting, falling back on anything unparseable so a
++ * typo cannot silently change startup behaviour.
++ */
++static unsigned int
++raop_env_uint(const char *name, unsigned int fallback, unsigned int maximum)
++{
++  const char *value = getenv(name);
++  char *end;
++  unsigned long parsed;
++
++  if (!value || !*value)
++    return fallback;
++
++  errno = 0;
++  parsed = strtoul(value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0' || parsed > maximum)
++    {
++      DPRINTF(E_LOG, L_RAOP, "Ignoring %s: '%s' is not a number of at most %u, using %u\n", name, value, maximum, fallback);
++      return fallback;
++    }
++
++  return (unsigned int)parsed;
++}
++
+ static uint32_t
+ raop_sdp_latency_bound(const char *name, uint32_t fallback)
+ {
+@@ -2368,7 +2408,12 @@ session_make(struct output_device *rd, int callback_id, bool only_probe)
+     const char *native_device = getenv("SOUNDFERRY_RAOP_NATIVE_COMPAT_DEVICE");
+     rs->native_compat = native_device && strcmp(rd->name, native_device) == 0;
+     if (rs->native_compat)
+-      DPRINTF(E_LOG, L_RAOP, "Experimental native wire compatibility profile enabled for '%s'\n", rd->name);
++      {
++        rs->native_startup.required_timing_replies = raop_env_uint("SOUNDFERRY_RAOP_STARTUP_TIMING_REPLIES", 0, 3);
++        rs->native_startup.timing_wait_ms = raop_env_uint("SOUNDFERRY_RAOP_STARTUP_TIMING_WAIT_MS", 0, 10000);
++        DPRINTF(E_LOG, L_RAOP, "Experimental native wire compatibility profile enabled for '%s' (startup waits for %u timing exchanges, up to %lld ms)\n",
++          rd->name, rs->native_startup.required_timing_replies, (long long)rs->native_startup.timing_wait_ms);
++      }
+   }
+ 
+   rs->volume = rd->volume;
+@@ -3377,8 +3422,11 @@ packets_send(struct raop_master_session *rms)
+                   deferred_session_failure(rs);
+                   continue;
+                 }
+-              DPRINTF(E_LOG, L_RAOP, "Native first-audio FLUSH sent to '%s': seq=%" PRIu16 ";rtptime=%u timing=%u\n",
+-                      rs->devname, rms->rtp_session->seqnum, rms->rtp_session->pos, rs->native_startup.timing_replies);
++              DPRINTF(E_LOG, L_RAOP, "Native first-audio FLUSH sent to '%s': seq=%" PRIu16 ";rtptime=%u timing=%u/%u after %lld ms%s\n",
++                      rs->devname, rms->rtp_session->seqnum, rms->rtp_session->pos,
++                      rs->native_startup.timing_replies, rs->native_startup.required_timing_replies,
++                      (long long)(rs->native_startup.audio_ms - rs->native_startup.sync_ms),
++                      rs->native_startup.timing_replies < rs->native_startup.required_timing_replies ? " (gave up waiting)" : "");
+             }
+           if (rs->offset_reanchor_pending && rs->state == RAOP_STATE_STREAMING)
+             {
