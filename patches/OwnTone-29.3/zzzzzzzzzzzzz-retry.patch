@@ -1,0 +1,12 @@
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -3031,7 +3031,8 @@
+ 
+   // Drop session, try again with ipv4
+   session_cleanup(session);
+-  airplay_device_start(device, callback_id);
++  if (airplay_device_start(device, callback_id) < 0)
++    outputs_cb(callback_id, device->id, OUTPUT_STATE_FAILED);
+ }
+ 
+ 

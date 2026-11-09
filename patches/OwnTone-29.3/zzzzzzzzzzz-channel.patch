@@ -1,0 +1,719 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -67,6 +67,14 @@
+ #ifdef CHROMECAST
+   OUTPUT_TYPE_CAST,
+ #endif
++};
++
++enum output_channel_mode
++{
++  OUTPUT_CHANNEL_STEREO = 0,
++  OUTPUT_CHANNEL_MONO,
++  OUTPUT_CHANNEL_LEFT,
++  OUTPUT_CHANNEL_RIGHT
+ };
+ 
+ /* Output session state */
+@@ -136,6 +144,8 @@
+ 
+   // For user config of speaker start
+   int offset_ms;
++
++  enum output_channel_mode channel_mode;
+ 
+   // Address
+   char *v4_address;
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -779,6 +779,8 @@
+   struct output_device *device;
+   char *keep_name;
+   int keep_offset_ms;
++  int channel_mode;
++  char channel_key[80];
+   int ret;
+ 
+   for (device = outputs_device_list; device; device = device->next)
+@@ -824,6 +826,14 @@
+ 
+       if (keep_offset_ms != 0)
+ 	device->offset_ms = keep_offset_ms;
++
++      // Keep compatibility with older OwnTone runtimes: use a namespaced
++      // admin key rather than changing the shared speakers schema.
++      snprintf(channel_key, sizeof(channel_key), "soundferry.channel_mode.%" PRIu64, device->id);
++      device->channel_mode = OUTPUT_CHANNEL_STEREO;
++      if (db_admin_getint(&channel_mode, channel_key) == 0 &&
++          channel_mode >= OUTPUT_CHANNEL_STEREO && channel_mode <= OUTPUT_CHANNEL_RIGHT)
++        device->channel_mode = channel_mode;
+ 
+       if (new_deselect)
+ 	device->selected = 0;
+--- a/src/player.h
++++ b/src/player.h
+@@ -37,6 +37,8 @@
+   int relvol;
+   int absvol;
+   int offset_ms;
++  int channel_mode;
++  bool channel_mode_supported;
+ 
+   enum media_format format;
+   uint32_t supported_formats;
+@@ -136,6 +138,9 @@
+ player_speaker_offset_ms_set(uint64_t id, int offset_ms);
+ 
+ int
++player_speaker_channel_mode_set(uint64_t id, int channel_mode);
++
++int
+ player_streaming_register(int *audio_fd, int *metadata_fd, enum media_format format, struct media_quality quality);
+ 
+ int
+--- a/src/player.c
++++ b/src/player.c
+@@ -155,6 +155,7 @@
+   struct media_quality quality;
+   enum media_format format;
+   int offset_ms;
++  int channel_mode;
+ 
+   int audio_fd;
+   int metadata_fd;
+@@ -2664,6 +2665,12 @@
+   spk->relvol = device->relvol;
+   spk->absvol = device->volume;
+   spk->offset_ms = device->offset_ms;
++  spk->channel_mode = device->channel_mode;
++  spk->channel_mode_supported = (device->type == OUTPUT_TYPE_RAOP || device->type == OUTPUT_TYPE_AIRPLAY
++#ifdef CHROMECAST
++                                || device->type == OUTPUT_TYPE_CAST
++#endif
++                                );
+ 
+   spk->supported_formats = device->supported_formats;
+   // Devices supporting more than one format should at least have default_format set
+@@ -3031,6 +3038,39 @@
+  error:
+   DPRINTF(E_LOG, L_PLAYER, "Error setting format '%s', device unknown or format unsupported\n", media_format_to_string(param->format));
+   *retval = -1;
++  return COMMAND_END;
++}
++
++static enum command_state
++speaker_channel_mode_set(void *arg, int *retval)
++{
++  struct speaker_attr_param *param = arg;
++  struct output_device *device;
++  char key[80];
++
++  *retval = -1;
++  if (param->channel_mode < OUTPUT_CHANNEL_STEREO || param->channel_mode > OUTPUT_CHANNEL_RIGHT)
++    return COMMAND_END;
++  device = outputs_device_get(param->spk_id);
++  if (!device)
++    return COMMAND_END;
++  if (device->type != OUTPUT_TYPE_RAOP && device->type != OUTPUT_TYPE_AIRPLAY
++#ifdef CHROMECAST
++      && device->type != OUTPUT_TYPE_CAST
++#endif
++      )
++    return COMMAND_END;
++
++  // The active session snapshots its mode. Do not report success if the
++  // change cannot take effect: the caller must first stop the output.
++  if (device->session)
++    return COMMAND_END;
++
++  snprintf(key, sizeof(key), "soundferry.channel_mode.%" PRIu64, device->id);
++  if (db_admin_setint(key, param->channel_mode) < 0)
++    return COMMAND_END;
++  device->channel_mode = param->channel_mode;
++  *retval = 0;
+   return COMMAND_END;
+ }
+ 
+@@ -3795,6 +3835,16 @@
+ }
+ 
+ int
++player_speaker_channel_mode_set(uint64_t id, int channel_mode)
++{
++  struct speaker_attr_param param;
++
++  param.spk_id = id;
++  param.channel_mode = channel_mode;
++  return commands_exec_sync(cmdbase, speaker_channel_mode_set, speaker_generic_bh, &param);
++}
++
++int
+ player_speaker_offset_ms_set(uint64_t id, int offset_ms)
+ {
+   struct speaker_attr_param param;
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -52,6 +52,7 @@
+ #include "misc.h"
+ #include "misc_json.h"
+ #include "player.h"
++#include "outputs.h"
+ #include "remote_pairing.h"
+ #include "settings.h"
+ #include "smartpl_query.h"
+@@ -1634,6 +1635,15 @@
+   json_object_object_add(output, "needs_auth_key", json_object_new_boolean(spk->needs_auth_key));
+   json_object_object_add(output, "volume", json_object_new_int(spk->absvol));
+   json_object_object_add(output, "offset_ms", json_object_new_int(spk->offset_ms));
++  const char *channel_mode = "stereo";
++  switch (spk->channel_mode)
++    {
++      case OUTPUT_CHANNEL_MONO: channel_mode = "mono"; break;
++      case OUTPUT_CHANNEL_LEFT: channel_mode = "left"; break;
++      case OUTPUT_CHANNEL_RIGHT: channel_mode = "right"; break;
++    }
++  if (spk->channel_mode_supported)
++    json_object_object_add(output, "channel_mode", json_object_new_string(channel_mode));
+   json_object_object_add(output, "format", json_object_new_string(media_format_to_string(spk->format)));
+   json_object_object_add(output, "supported_formats", supported_formats);
+ 
+@@ -1701,6 +1711,9 @@
+   int offset_ms;
+   const char *pin;
+   const char *format;
++  const char *channel_mode;
++  json_object *channel_object;
++  int mode;
+   int ret;
+ 
+   ret = safe_atou64(hreq->path_parts[2], &output_id);
+@@ -1750,6 +1763,19 @@
+ 	goto error;
+     }
+ 
++  if (json_object_object_get_ex(request, "channel_mode", &channel_object))
++    {
++      if (!json_object_is_type(channel_object, json_type_string)) goto error;
++      channel_mode = jparse_str_from_obj(request, "channel_mode");
++      if (!channel_mode) goto error;
++      if (strcmp(channel_mode, "stereo") == 0) mode = OUTPUT_CHANNEL_STEREO;
++      else if (strcmp(channel_mode, "mono") == 0) mode = OUTPUT_CHANNEL_MONO;
++      else if (strcmp(channel_mode, "left") == 0) mode = OUTPUT_CHANNEL_LEFT;
++      else if (strcmp(channel_mode, "right") == 0) mode = OUTPUT_CHANNEL_RIGHT;
++      else goto error;
++      if (player_speaker_channel_mode_set(output_id, mode) < 0) goto error;
++    }
++
+   if (jparse_contains_key(request, "offset_ms", json_type_int))
+     {
+       offset_ms = jparse_int_from_obj(request, "offset_ms");
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -210,6 +210,7 @@
+ 
+ struct airplay_master_session
+ {
++  enum output_channel_mode channel_mode;
+   struct evbuffer *input_buffer;
+   uint32_t input_buffer_samples;
+ 
+@@ -1148,7 +1149,7 @@
+ }
+ 
+ static struct airplay_master_session *
+-master_session_make(struct media_quality *quality, bool use_ptp)
++master_session_make(struct media_quality *quality, bool use_ptp, enum output_channel_mode channel_mode)
+ {
+   struct airplay_master_session *ams;
+   uint64_t buffer_duration_ms;
+@@ -1156,10 +1157,17 @@
+   uint64_t clock_id;
+   int ret;
+ 
++  if (channel_mode != OUTPUT_CHANNEL_STEREO &&
++      (quality->bits_per_sample != 16 || quality->channels != 2))
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "Unsupported PCM for channel mapping\n");
++      return NULL;
++    }
++
+   // First check if we already have a suitable session
+   for (ams = airplay_master_sessions; ams; ams = ams->next)
+     {
+-      if (quality_is_equal(quality, &ams->rtp_session->quality) && use_ptp == ams->use_ptp)
++      if (quality_is_equal(quality, &ams->rtp_session->quality) && use_ptp == ams->use_ptp && channel_mode == ams->channel_mode)
+ 	return ams;
+     }
+ 
+@@ -1203,6 +1211,7 @@
+       goto error;
+     }
+ 
++  ams->channel_mode = channel_mode;
+   ams->quality = *quality;
+   ams->use_ptp = use_ptp;
+   ams->samples_per_packet = AIRPLAY_SAMPLES_PER_PACKET;
+@@ -1627,7 +1636,7 @@
+ 	goto error;
+     }
+ 
+-  session->master_session = master_session_make(&device->quality, extra->use_ptp);
++  session->master_session = master_session_make(&device->quality, extra->use_ptp, device->channel_mode);
+   if (!session->master_session)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", device->name);
+@@ -4255,6 +4264,9 @@
+ 
+   return 1;
+ }
++
++
++#include "channel_map.h"
+ 
+ static void
+ airplay_write(struct output_buffer *obuf)
+@@ -4285,7 +4297,13 @@
+ 	  while (evbuffer_get_length(ams->input_buffer) >= ams->rawbuf_size)
+ 	    {
+ 	      evbuffer_remove(ams->input_buffer, ams->rawbuf, ams->rawbuf_size);
+-	      ams->input_buffer_samples -= ams->samples_per_packet;
++              ams->input_buffer_samples -= ams->samples_per_packet;
++              if (ams->channel_mode != OUTPUT_CHANNEL_STEREO &&
++                  soundferry_channel_map_pcm16(ams->rawbuf, ams->rawbuf_size, ams->channel_mode) < 0)
++                {
++                  DPRINTF(E_LOG, L_AIRPLAY, "Unsupported PCM for channel mapping\n");
++                  continue;
++                }
+ 
+ 	      packets_send(ams);
+ 	    }
+--- a/src/outputs/raop.c
++++ b/src/outputs/raop.c
+@@ -166,6 +166,7 @@
+ 
+ struct raop_master_session
+ {
++  enum output_channel_mode channel_mode;
+   struct evbuffer *input_buffer;
+   uint32_t input_buffer_samples;
+ 
+@@ -2069,17 +2070,24 @@
+ }
+ 
+ static struct raop_master_session *
+-master_session_make(struct media_quality *quality, bool encrypt)
++master_session_make(struct media_quality *quality, bool encrypt, enum output_channel_mode channel_mode)
+ {
+   struct raop_master_session *rms;
+   struct transcode_encode_setup_args encode_args = { .profile = XCODE_ALAC, .quality = quality };
+   uint64_t buffer_duration_ms;
+   int ret;
++
++  if (channel_mode != OUTPUT_CHANNEL_STEREO &&
++      (quality->bits_per_sample != 16 || quality->channels != 2))
++    {
++      DPRINTF(E_LOG, L_RAOP, "Unsupported PCM for channel mapping\n");
++      return NULL;
++    }
+ 
+   // First check if we already have a suitable session
+   for (rms = raop_master_sessions; rms; rms = rms->next)
+     {
+-      if (encrypt == rms->encrypt && quality_is_equal(quality, &rms->rtp_session->quality))
++      if (encrypt == rms->encrypt && channel_mode == rms->channel_mode && quality_is_equal(quality, &rms->rtp_session->quality))
+ 	return rms;
+     }
+ 
+@@ -2123,6 +2131,7 @@
+       goto error;
+     }
+ 
++  rms->channel_mode = channel_mode;
+   rms->encrypt = encrypt;
+   rms->quality = *quality;
+   rms->samples_per_packet = RAOP_SAMPLES_PER_PACKET;
+@@ -2477,7 +2486,7 @@
+ 	goto error;
+     }
+ 
+-  rs->master_session = master_session_make(&rd->quality, rs->encrypt);
++  rs->master_session = master_session_make(&rd->quality, rs->encrypt, rd->channel_mode);
+   if (!rs->master_session)
+     {
+       DPRINTF(E_LOG, L_RAOP, "Could not attach a master session for device '%s'\n", rd->name);
+@@ -5639,6 +5648,9 @@
+ 
+   free(re);
+ }
++
++
++#include "channel_map.h"
+ 
+ static void
+ raop_write(struct output_buffer *obuf)
+@@ -5670,6 +5682,12 @@
+ 	    {
+ 	      evbuffer_remove(rms->input_buffer, rms->rawbuf, rms->rawbuf_size);
+ 	      rms->input_buffer_samples -= rms->samples_per_packet;
++              if (rms->channel_mode != OUTPUT_CHANNEL_STEREO &&
++                  soundferry_channel_map_pcm16(rms->rawbuf, rms->rawbuf_size, rms->channel_mode) < 0)
++                {
++                  DPRINTF(E_LOG, L_RAOP, "Invalid PCM channel mapping input\n");
++                  continue;
++                }
+ 
+ 	      packets_send(rms);
+ 	    }
+--- a/src/outputs/cast.c
++++ b/src/outputs/cast.c
+@@ -142,11 +142,15 @@
+ 
+ //#define DEBUG_CHROMECAST 1
+ 
++#include "channel_mix.h"
++#define CHANNEL_MODE_COUNT 4
+ struct cast_session;
+ struct cast_msg_payload;
+ 
+-static struct encode_ctx *cast_encode_ctx;
+-static struct evbuffer *cast_encoded_data;
++static struct encode_ctx *cast_encode_ctx[CHANNEL_MODE_COUNT];
++static struct evbuffer *cast_encoded_data[CHANNEL_MODE_COUNT];
++/* An encoder error may leave the four contexts at different frames. */
++static bool cast_encoders_failed;
+ 
+ typedef void (*cast_reply_cb)(struct cast_session *cs, struct cast_msg_payload *payload);
+ 
+@@ -184,6 +188,8 @@
+   int evbuf_samples;
+ 
+   struct rtp_session *rtp_session;
++  struct rtp_session *rtp_modes[CHANNEL_MODE_COUNT];
++  uint8_t *mixedbuf;
+ 
+   struct media_quality quality;
+ 
+@@ -198,6 +204,7 @@
+ {
+   uint64_t device_id;
+   int callback_id;
++  enum channel_mode channel_mode;
+ 
+   struct cast_master_session *master_session;
+ 
+@@ -512,7 +519,10 @@
+     return;
+ 
+   outputs_quality_unsubscribe(&cms->rtp_session->quality);
++  for (int m = 1; m < CHANNEL_MODE_COUNT; m++)
++    if (cms->rtp_modes[m]) rtp_session_free(cms->rtp_modes[m]);
+   rtp_session_free(cms->rtp_session);
++  free(cms->mixedbuf);
+   rtp_session_free(cms->rtp_artwork);
+   evbuffer_free(cms->evbuf);
+   free(cms->rawbuf);
+@@ -912,7 +922,7 @@
+ 
+ // OPUS encodes the rawbuf payload
+ static int
+-payload_encode(struct evbuffer *evbuf, uint8_t *rawbuf, size_t rawbuf_size, int nsamples, struct media_quality *quality)
++payload_encode(struct evbuffer *evbuf, uint8_t *rawbuf, size_t rawbuf_size, int nsamples, struct media_quality *quality, struct encode_ctx *encoder)
+ {
+   transcode_frame *frame;
+   int len;
+@@ -924,7 +934,7 @@
+       return -1;
+     }
+ 
+-  len = transcode_encode(evbuf, cast_encode_ctx, frame, 0);
++  len = transcode_encode(evbuf, encoder, frame, 0);
+   transcode_frame_free(frame);
+   if (len < 0)
+     {
+@@ -958,30 +968,44 @@
+   return evbuffer_remove(evbuf, pkt->payload + CAST_HEADER_SIZE, pkt->payload_len - CAST_HEADER_SIZE);
+ }
+ 
++/* Experimental: encode every mode continuously and commit RTP packets only
++ * after every variant has been produced. Failed frames must stop the route. */
+ static int
+ packet_make(struct cast_master_session *cms)
+ {
+-  struct rtp_packet *pkt;
+-  int len;
+-  int ret;
+-
+-  // Encode payload into cast_encoded_data
+-  len = payload_encode(cast_encoded_data, cms->rawbuf, cms->rawbuf_size, cms->samples_per_packet, &cms->quality);
+-  if (len < 0)
+-    return -1;
+-
+-  // For audio it is always a complete frame, so marker bit is 1 (like Chromium does)
+-  pkt = rtp_packet_next(cms->rtp_session, CAST_HEADER_SIZE + len, cms->samples_per_packet, CAST_RTP_PAYLOADTYPE_AUDIO | RTP_MARKER_BIT);
+-
+-  // Creates Cast header + adds payload
+-  ret = packet_prepare(pkt, cast_encoded_data);
+-  if (ret < 0)
+-    return -1;
+-
+-  // Commits packet to retransmit buffer, and prepares the session for the next packet
+-  rtp_packet_commit(cms->rtp_session, pkt);
+-
++  struct rtp_packet *pkts[CHANNEL_MODE_COUNT];
++  int lengths[CHANNEL_MODE_COUNT];
++  int m;
++  for (m = 0; m < CHANNEL_MODE_COUNT; m++)
++    {
++      channel_mix_pcm16((int16_t *)cms->mixedbuf, (const int16_t *)cms->rawbuf,
++                        cms->samples_per_packet, (enum channel_mode)m);
++      lengths[m] = payload_encode(cast_encoded_data[m], cms->mixedbuf, cms->rawbuf_size,
++                                  cms->samples_per_packet, &cms->quality, cast_encode_ctx[m]);
++      if (lengths[m] < 0) goto fail;
++    }
++  for (m = 0; m < CHANNEL_MODE_COUNT; m++)
++    {
++      pkts[m] = rtp_packet_next(cms->rtp_modes[m], CAST_HEADER_SIZE + lengths[m],
++                                cms->samples_per_packet, CAST_RTP_PAYLOADTYPE_AUDIO | RTP_MARKER_BIT);
++      if (!pkts[m] || packet_prepare(pkts[m], cast_encoded_data[m]) < 0) goto fail;
++    }
++  for (m = 0; m < CHANNEL_MODE_COUNT; m++)
++    rtp_packet_commit(cms->rtp_modes[m], pkts[m]);
+   return 0;
++fail:
++  /* Fail closed until the output is reinitialised: partial encoding can
++   * advance only a subset of Opus contexts, so they cannot be reused. */
++  cast_encoders_failed = true;
++  /* rtp_packet_next() may already have overwritten an uncommitted ring
++   * slot. All sessions are about to stop, so invalidate every retransmit
++   * history before returning to the event loop. */
++  for (m = 0; m < CHANNEL_MODE_COUNT; m++)
++    {
++      evbuffer_drain(cast_encoded_data[m], evbuffer_get_length(cast_encoded_data[m]));
++      rtp_session_flush(cms->rtp_modes[m]);
++    }
++  return -1;
+ }
+ 
+ static inline int
+@@ -1002,8 +1026,9 @@
+       cms->evbuf_samples -= cms->samples_per_packet;
+ 
+       ret = packet_make(cms);
+-      if (ret == 0)
+-	npkts++;
++      if (ret < 0)
++        return -1;
++      npkts++;
+     }
+ 
+   return npkts;
+@@ -1012,7 +1037,7 @@
+ static int
+ packet_send(struct cast_session *cs, uint16_t seqnum)
+ {
+-  struct rtp_session *rtp_session = cs->master_session->rtp_session;
++  struct rtp_session *rtp_session = cs->master_session->rtp_modes[cs->channel_mode];
+   struct rtp_packet *pkt;
+   int ret;
+ 
+@@ -1919,12 +1944,21 @@
+   cms->rtp_session->ssrc_id = ((cms->rtp_session->ssrc_id + CAST_SSRC_AUDIO_MIN) % CAST_SSRC_AUDIO_MAX) + CAST_SSRC_AUDIO_MIN;
+ 
+   cms->rtp_session->seqnum = 0; // TODO test
++  cms->rtp_modes[0] = cms->rtp_session;
++  for (int m = 1; m < CHANNEL_MODE_COUNT; m++)
++    {
++      CHECK_NULL(L_CAST, cms->rtp_modes[m] = rtp_session_new(quality, CAST_PACKET_BUFFER_SIZE, 0, 0));
++      cms->rtp_modes[m]->ssrc_id = cms->rtp_session->ssrc_id;
++      cms->rtp_modes[m]->seqnum = cms->rtp_session->seqnum;
++      cms->rtp_modes[m]->pos = cms->rtp_session->pos;
++    }
+ 
+   cms->quality = *quality;
+   cms->samples_per_packet = CAST_SAMPLES_PER_PACKET;
+   cms->rawbuf_size = STOB(cms->samples_per_packet, quality->bits_per_sample, quality->channels);
+ 
+   CHECK_NULL(L_CAST, cms->rawbuf = malloc(cms->rawbuf_size));
++  CHECK_NULL(L_CAST, cms->mixedbuf = malloc(cms->rawbuf_size));
+   CHECK_NULL(L_CAST, cms->evbuf = evbuffer_new());
+ 
+   CHECK_NULL(L_CAST, cms->rtp_artwork = rtp_session_new(NULL, CAST_PACKET_ARTWORK_SIZE, 0, 0));
+@@ -1976,6 +2010,10 @@
+   cs->state = CAST_STATE_DISCONNECTED;
+   cs->device_id = device->id;
+   cs->callback_id = callback_id;
++  /* Prototype: settings are sampled at connection; a change requires reconnect. */
++  cs->channel_mode = (enum channel_mode)device->channel_mode;
++  if (cs->channel_mode < CHANNEL_STEREO || cs->channel_mode > CHANNEL_RIGHT)
++    cs->channel_mode = CHANNEL_STEREO;
+ 
+   cs->master_session = master_session_make(&cast_quality_default);
+   if (!cs->master_session)
+@@ -2175,6 +2213,12 @@
+ {
+   struct cast_session *cs;
+   int ret;
++
++  if (cast_encoders_failed)
++    {
++      DPRINTF(E_LOG, L_CAST, "Cast encoders failed; restart OwnTone before reconnecting\n");
++      return -1;
++    }
+ 
+   cs = cast_session_make(device, AF_INET6, callback_id);
+   if (cs)
+@@ -2286,7 +2330,7 @@
+   int i;
+   int ret;
+ 
+-  if (!cast_sessions)
++  if (!cast_sessions || cast_encoders_failed)
+     return;
+ 
+   for (i = 0; obuf->data[i].buffer; i++)
+@@ -2302,7 +2346,20 @@
+     }
+ 
+   // Converts the raw audio in the output_buffer to Chromecast packets
+-  packets_make(cast_master_session, &obuf->data[i]);
++  if (packets_make(cast_master_session, &obuf->data[i]) < 0)
++    {
++      DPRINTF(E_LOG, L_CAST, "Channel encoding failed; stopping Cast sessions\n");
++      for (cs = cast_sessions; cs; cs = next)
++        {
++          next = cs->next;
++          /* Prevent pending feedback from retransmitting while STOP is in flight. */
++          if (cs->rtcp_ev)
++            event_del(cs->rtcp_ev);
++          /* Preserve the current state so shutdown closes UDP and MEDIA first. */
++          cast_session_shutdown(cs, CAST_STATE_FAILED);
++        }
++      return;
++    }
+ 
+   for (cs = cast_sessions; cs; cs = next)
+     {
+@@ -2423,6 +2480,8 @@
+   int i;
+   int ret;
+ 
++  cast_encoders_failed = false;
++
+   // Sanity check
+   for (i = 1; cast_msg[i].type; i++)
+     {
+@@ -2450,13 +2509,17 @@
+       goto out_tls_deinit;
+     }
+ 
+-  cast_encode_ctx = transcode_encode_setup(encode_args);
+-  transcode_decode_cleanup(&encode_args.src_ctx);
+-  if (!cast_encode_ctx)
++  for (i = 0; i < CHANNEL_MODE_COUNT; i++)
+     {
+-      DPRINTF(E_LOG, L_CAST, "Will not be able to stream Chromecast, libav does not support Opus encoding\n");
+-      goto out_tls_deinit;
++      cast_encode_ctx[i] = transcode_encode_setup(encode_args);
++      cast_encoded_data[i] = evbuffer_new();
++      if (!cast_encode_ctx[i] || !cast_encoded_data[i])
++        {
++          transcode_decode_cleanup(&encode_args.src_ctx);
++          goto out_encode_ctx_free;
++        }
+     }
++  transcode_decode_cleanup(&encode_args.src_ctx);
+ 
+   ret = mdns_browse("_googlecast._tcp", cast_device_cb, 0);
+   if (ret < 0)
+@@ -2465,12 +2528,14 @@
+       goto out_encode_ctx_free;
+     }
+ 
+-  CHECK_NULL(L_CAST, cast_encoded_data = evbuffer_new());
+-
+   return 0;
+ 
+  out_encode_ctx_free:
+-  transcode_encode_cleanup(&cast_encode_ctx);
++  for (i = 0; i < CHANNEL_MODE_COUNT; i++)
++    {
++      if (cast_encoded_data[i]) evbuffer_free(cast_encoded_data[i]);
++      if (cast_encode_ctx[i]) transcode_encode_cleanup(&cast_encode_ctx[i]);
++    }
+  out_tls_deinit:
+   gnutls_certificate_free_credentials(tls_credentials);
+   gnutls_global_deinit();
+@@ -2489,8 +2554,11 @@
+       cast_session_free(cs);
+     }
+ 
+-  evbuffer_free(cast_encoded_data);
+-  transcode_encode_cleanup(&cast_encode_ctx);
++  for (int i = 0; i < CHANNEL_MODE_COUNT; i++)
++    {
++      evbuffer_free(cast_encoded_data[i]);
++      transcode_encode_cleanup(&cast_encode_ctx[i]);
++    }
+ 
+   gnutls_certificate_free_credentials(tls_credentials);
+   gnutls_global_deinit();
+--- /dev/null
++++ b/src/outputs/channel_map.h
+@@ -0,0 +1,33 @@
++#ifndef SOUNDFERRY_CHANNEL_MAP_H
++#define SOUNDFERRY_CHANNEL_MAP_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++/* Interleaved, native-endian, signed 16-bit stereo, as used by XCODE_PCM16. */
++static int
++soundferry_channel_map_pcm16(uint8_t *buffer, size_t size, int mode)
++{
++  size_t offset;
++  if (!buffer || size % (2 * sizeof(int16_t)) || mode < 0 || mode > 3)
++    return -1;
++  for (offset = 0; offset < size; offset += 2 * sizeof(int16_t))
++    {
++      int16_t l, r, v;
++      memcpy(&l, buffer + offset, sizeof(l));
++      memcpy(&r, buffer + offset + sizeof(l), sizeof(r));
++      switch (mode)
++        {
++          case 0: continue;
++          case 1: v = (int16_t)(((int32_t)l + (int32_t)r) / 2); break;
++          case 2: v = l; break;
++          case 3: v = r; break;
++          default: return -1;
++        }
++      memcpy(buffer + offset, &v, sizeof(v));
++      memcpy(buffer + offset + sizeof(v), &v, sizeof(v));
++    }
++  return 0;
++}
++#endif
+--- /dev/null
++++ b/src/outputs/channel_mix.h
+@@ -0,0 +1,21 @@
++#ifndef SOUND_FERRY_CHANNEL_MIX_H
++#define SOUND_FERRY_CHANNEL_MIX_H
++#include <stdint.h>
++#include <stddef.h>
++enum channel_mode { CHANNEL_STEREO, CHANNEL_MONO, CHANNEL_LEFT, CHANNEL_RIGHT };
++/* Interleaved native-endian signed 16-bit stereo; output must have 2*frames samples. */
++static inline int channel_mix_pcm16(int16_t *out, const int16_t *in, size_t frames, enum channel_mode mode)
++{
++    if (!out || !in || mode < CHANNEL_STEREO || mode > CHANNEL_RIGHT) return -1;
++    for (size_t i = 0; i < frames; ++i) {
++        int16_t l = in[2*i], r = in[2*i+1];
++        switch (mode) {
++        case CHANNEL_STEREO: out[2*i] = l; out[2*i+1] = r; break;
++        case CHANNEL_MONO: out[2*i] = out[2*i+1] = (int16_t)(((int32_t)l + r) / 2); break;
++        case CHANNEL_LEFT: out[2*i] = out[2*i+1] = l; break;
++        case CHANNEL_RIGHT: out[2*i] = out[2*i+1] = r; break;
++        }
++    }
++    return 0;
++}
++#endif
