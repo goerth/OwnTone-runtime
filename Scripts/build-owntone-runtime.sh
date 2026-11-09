@@ -145,6 +145,16 @@ stamps="${build_root}/stamps"
 
 export PKG_CONFIG_PATH="${prefix}/lib/pkgconfig"
 export PATH="${prefix}/bin:${PATH}"
+# libunistring's declared.sh calls sed directly and requires GNU sed. macOS
+# provides BSD sed as /usr/bin/sed, so use a private wrapper directory when
+# Homebrew installs GNU sed under its usual gsed name.
+if ! sed --version 2>/dev/null | /usr/bin/grep -q 'GNU sed'; then
+  gnu_sed="$(command -v gsed || true)"
+  [[ -n "${gnu_sed}" ]] || fail "GNU sed is required; install it with: brew install gnu-sed" 69
+  /bin/mkdir -p "${build_root}/host-tools"
+  /bin/ln -sf "${gnu_sed}" "${build_root}/host-tools/sed"
+  export PATH="${build_root}/host-tools:${PATH}"
+fi
 common_cflags="-arch ${release_architecture} -mmacosx-version-min=${deployment_target} -O2"
 common_ldflags="-arch ${release_architecture} -mmacosx-version-min=${deployment_target} -L${prefix}/lib -Wl,-headerpad_max_install_names"
 common_cppflags="-I${prefix}/include"
@@ -193,9 +203,17 @@ fetch_component() {
   local expected actual
 
   if [[ ! -f "${archive}" ]]; then
-    print -r -- "    fetching ${url}"
-    /usr/bin/curl --fail --location --silent --show-error --retry 2 --output "${archive}.partial" "${url}"
-    /bin/mv -f "${archive}.partial" "${archive}"
+    # Corresponding-source bundles carry every pinned tarball offline outside
+    # the build tree, so --fresh cannot delete its inputs.
+    local bundled_archive="${project_root}/source-archives/${component_archive[${name}]}"
+    if [[ -f "${bundled_archive}" ]]; then
+      print -r -- "    using bundled source ${component_archive[${name}]}"
+      /bin/cp "${bundled_archive}" "${archive}"
+    else
+      print -r -- "    fetching ${url}"
+      /usr/bin/curl --fail --location --silent --show-error --retry 2 --output "${archive}.partial" "${url}"
+      /bin/mv -f "${archive}.partial" "${archive}"
+    fi
   fi
   actual="$(/usr/bin/shasum -a 256 "${archive}" | /usr/bin/awk '{ print $1 }')"
 
@@ -466,15 +484,16 @@ build_owntone() {
   [[ -n "${dir}" && -d "${dir}" ]] \
     || fail "OwnTone's extracted source tree is missing; refusing to apply patches without it." 65
 
-  # The three local patches are GPL derivative works of OwnTone and live in
-  # ThirdPartyPatches/. They are applied here so the built binary matches the
-  # corresponding source this build can emit.
+  # These patches are GPL derivative works of OwnTone. Apply them in filename
+  # order so the built binary matches the corresponding source archive.
   if [[ ! -f "${dir}/.patched" ]]; then
     for patch_file in "${patch_dir}"/*.patch; do
       print -r -- "    applying ${patch_file:t}"
       (cd "${dir}" && /usr/bin/patch -p1 --forward --silent < "${patch_file}")
     done
-    : > "${dir}/.patched"
+    patch_fingerprint > "${dir}/.patched"
+  elif [[ "$(<"${dir}/.patched")" != "$(patch_fingerprint)" ]]; then
+    fail "OwnTone patch set changed; rerun with --fresh to rebuild it." 65
   fi
 
   # The app speaks to exactly four JSON endpoints and writes into a pipe, so
@@ -523,11 +542,23 @@ build_owntone() {
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
+patch_fingerprint() {
+  local patch_file
+  for patch_file in "${patch_dir}"/*.patch; do
+    /usr/bin/shasum -a 256 "${patch_file}" | /usr/bin/awk -v name="${patch_file:t}" '{print $1 " " name}'
+  done | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+}
+
 build_component() {
   local name="$1"
   local stamp="${stamps}/${name}"
 
   if [[ -f "${stamp}" ]]; then
+    if [[ "${name}" == owntone ]]; then
+      local patched_dir="$(source_dir_for owntone)"
+      [[ -f "${patched_dir}/.patched" && "$(<"${patched_dir}/.patched")" == "$(patch_fingerprint)" ]] \
+        || fail "OwnTone patch set cannot be verified; rerun with --fresh to rebuild it." 65
+    fi
     print -r -- "==> ${name} ${component_version[${name}]} (already built)"
     return 0
   fi
@@ -919,8 +950,8 @@ trap - EXIT HUP INT TERM
   print -r -- "deployment target: macOS ${deployment_target}"
   print -r -- ""
   print -r -- "Built from the pinned sources recorded in Scripts/owntone-sources.lock."
-  print -r -- "OwnTone is GPL-2.0-or-later and carries the three patches in"
-  print -r -- "ThirdPartyPatches/OwnTone-29.3, which are GPL-2.0-or-later derivative works."
+  print -r -- "OwnTone is GPL-2.0-or-later and carries the patches in"
+  print -r -- "patches/OwnTone-29.3, which are GPL-2.0-or-later derivative works."
   print -r -- "Corresponding source: ./Scripts/build-owntone-runtime.sh --emit-source-archive"
   print -r -- ""
   print -r -- "Components:"
@@ -937,14 +968,24 @@ if (( emit_source_archive )); then
   archive_root="${build_root}/corresponding-source"
   archive_name="owntone-corresponding-source-${component_version[owntone]}"
   /bin/rm -rf -- "${archive_root}"
-  /bin/mkdir -p "${archive_root}/${archive_name}"
-  # Complete corresponding source means actual bytes, not a script that fetches
-  # them: an upstream that retires a release must not make the obligation
-  # impossible to honour. The build recipe and the local patches go in too,
-  # because they are the scripts used to control compilation.
-  /bin/cp -R "${archives}"/*(N) "${archive_root}/${archive_name}/"
-  /bin/cp "${script_dir}/build-owntone-runtime.sh" "${lock_file}" "${archive_root}/${archive_name}/"
-  /bin/cp -R "${patch_dir}" "${archive_root}/${archive_name}/patches"
+  /bin/mkdir -p "${archive_root}/${archive_name}/source-archives" \
+    "${archive_root}/${archive_name}/Scripts" "${archive_root}/${archive_name}/patches"
+  # Preserve repository layout and source archives outside .build: extracting
+  # this directory makes the included build script usable offline even when a
+  # clean --fresh build removes .build. Every archive is checksum-verified.
+  /bin/cp -R "${archives}"/*(N) "${archive_root}/${archive_name}/source-archives/"
+  /bin/cp "${script_dir}/build-owntone-runtime.sh" "${lock_file}" "${archive_root}/${archive_name}/Scripts/"
+  /bin/cp -R "${patch_dir}" "${archive_root}/${archive_name}/patches/OwnTone-29.3"
+  /bin/cat > "${archive_root}/${archive_name}/README.txt" <<'EOF'
+Run from this directory on an Apple Silicon Mac with Xcode command line tools,
+Homebrew build dependencies, and GNU sed installed:
+
+  ./Scripts/build-owntone-runtime.sh --fresh --emit-source-archive
+
+All source archives are included in source-archives and verified against the
+lock file. The build does not need to fetch them from the network.
+EOF
+  /bin/mkdir -p "${project_root}/dist"
   (cd "${archive_root}" && /usr/bin/tar -czf "${project_root}/dist/${archive_name}.tar.gz" "${archive_name}")
   print -r -- "Corresponding source: ${project_root}/dist/${archive_name}.tar.gz"
 fi

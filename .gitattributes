@@ -1,0 +1,2 @@
+# Patch context is kept byte-for-byte to match the corresponding source.
+patches/OwnTone-29.3/*.patch -whitespace

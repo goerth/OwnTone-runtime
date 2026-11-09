@@ -85,6 +85,27 @@ Automatic playback suspension can then register its buffered-input resume
 callback. Explicit pause, stop, and abort cancel that recovery so a late input
 callback cannot restart playback against the user's command.
 
+`zzzzzzzzzzz-channel.patch`
+
+Adds per-output stereo, mono, left and right channel modes to the API and
+AirPlay 1/2 and Chromecast senders. Settings may only change with the receiver
+session stopped. Chromecast maintains separate mode encoders and histories.
+
+`zzzzzzzzzzzz-cast-cleanup.patch`
+
+Corrects cleanup after a Chromecast encoder failure.
+
+`zzzzzzzzzzzzz-retry.patch`
+
+Corrects failed-start callback accounting for output retry.
+
+These three patches are experimental until the combined build and all
+receiver paths, synchronization, recovery, and existing-user runtime updates
+have been verified. Do not publish based solely on a successful build.
+Use `./Scripts/build-owntone-runtime.sh --fresh --emit-source-archive` so the
+new patch set and corresponding source are included together. The script
+rejects reuse of an OwnTone build with a different or unknown patch set.
+
 Apply from the OwnTone source root:
 
 ```sh
